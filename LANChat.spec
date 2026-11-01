@@ -1,0 +1,26 @@
+# PyInstaller: сборка LAN Chat в самостоятельное приложение (без установки Python).
+# Windows -> dist/LANChat.exe, macOS -> dist/LANChat.app
+import sys
+
+a = Analysis(['lanchat.py'])
+pyz = PYZ(a.pure)
+
+if sys.platform == 'darwin':
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True,
+              name='LANChat', console=False)
+    coll = COLLECT(exe, a.binaries, a.datas, name='LANChat')
+    app = BUNDLE(
+        coll,
+        name='LANChat.app',
+        bundle_identifier='com.lanchat.app',
+        info_plist={
+            # без этого macOS не даст программе видеть локальную сеть
+            'NSLocalNetworkUsageDescription':
+                'LAN Chat обменивается сообщениями с компьютерами в вашей Wi-Fi сети.',
+            'NSHighResolutionCapable': True,
+            'CFBundleShortVersionString': '1.0',
+        },
+    )
+else:
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [],
+              name='LANChat', console=False, upx=False)

@@ -1,0 +1,35 @@
+name: Build LAN Chat
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller LANChat.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LANChat-Windows
+          path: dist/LANChat.exe
+
+  macos:
+    runs-on: macos-latest   # Apple Silicon (M1/M2/M3/M4)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller LANChat.spec
+      - run: cd dist && ditto -c -k --keepParent LANChat.app LANChat-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LANChat-Mac
+          path: dist/LANChat-mac.zip
