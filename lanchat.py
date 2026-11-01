@@ -615,8 +615,8 @@ def selftest():
 
         target = messages[3]["id"]
         before = "😮" in messages[3]["reactions"]
-        Api().react(target, "😮")
-        time.sleep(0.8)
+        ev("react(%s, '😮')" % json.dumps(target))      # так же, как клик в интерфейсе
+        time.sleep(1)
         checks["reaction_toggle"] = (not before) and "😮" in messages[3]["reactions"]
         checks["reaction_shown"] = bool(ev("[...document.querySelectorAll('.chip')].some(c => c.textContent.includes('😮'))"))
 
@@ -682,6 +682,8 @@ def main():
     ui.main.events.closing += on_closing
     ui.main.events.loaded += on_loaded
     webview.start()
+    if SELFTEST_DIR:
+        time.sleep(10)           # код завершения задаёт сама самопроверка
     os._exit(0)
 
 
@@ -807,12 +809,13 @@ textarea::placeholder{color:var(--muted)}
 
 /* всплывающие элементы */
 .menu{position:fixed;z-index:20;background:var(--menu);border:1px solid var(--line);border-radius:12px;
-  box-shadow:var(--shadow);padding:6px;min-width:250px;animation:pop .12s ease-out}
+  box-shadow:var(--shadow);padding:6px;min-width:250px;max-width:300px;animation:pop .12s ease-out}
 @keyframes pop{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
 .mi{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:8px 10px;border-radius:8px;font-size:14px}
 .mi:hover{background:var(--hover)}
 .mi .ic{color:var(--muted);flex:none}
-.mi .lb{flex:1}
+.mi .lb{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ml{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mi .ck{color:var(--accent);flex:none}
 .mi.danger{color:var(--danger)}
 .mi.danger .ic{color:var(--danger)}
@@ -1082,9 +1085,14 @@ function openPicker(btn,id){
     const b=el('button',(m.reactions?.[e]||[]).includes(S.me.uid)?'on':'',e);
     b.onclick=ev=>{ev.stopPropagation();react(id,e)};p.append(b);
   }
-  place(p,btn,true);
-  if(p.getBoundingClientRect().left<8)p.style.left='8px';
-  if(!m.mine)p.style.left=Math.max(8,btn.getBoundingClientRect().left-6)+'px';
+  // сбоку от кнопки, чтобы не закрывать текст сообщения
+  document.body.append(p);
+  const r=btn.getBoundingClientRect(),w=p.offsetWidth,h=p.offsetHeight;
+  let left=m.mine?r.left-w-6:r.right+6;
+  left=Math.min(Math.max(8,left),innerWidth-w-8);
+  let top=r.top+r.height/2-h/2;
+  if(top+h>innerHeight-8)top=r.top-h-6;
+  p.style.left=left+'px';p.style.top=Math.max(8,top)+'px';
 }
 $('#btn-emoji').onclick=e=>{
   e.stopPropagation();const btn=e.currentTarget;const wasOpen=!!$('.grid');closeAll();if(wasOpen)return;
