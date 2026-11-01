@@ -2,34 +2,80 @@ name: Build LAN Chat
 
 on:
   push:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller
-      - run: pyinstaller LANChat.spec
-      - uses: actions/upload-artifact@v4
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --noconfirm LANChat.spec
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path dist/LANChat -DestinationPath LANChat-Windows.zip
+      - uses: actions/upload-artifact@v5
         with:
           name: LANChat-Windows
-          path: dist/LANChat.exe
+          path: LANChat-Windows.zip
+      - name: Self-test with screenshots
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force shots | Out-Null
+          $env:LANCHAT_SELFTEST = (Resolve-Path shots).Path
+          $p = Start-Process dist/LANChat/LANChat.exe -PassThru -Wait
+          Write-Host "exit code: $($p.ExitCode)"
+          if (Test-Path shots/selftest.json) { Get-Content shots/selftest.json }
+          if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Publish screenshots
+        if: always()
+        shell: bash
+        run: |
+          [ -d shots ] || exit 0
+          cd shots
+          git init -q -b shots-windows
+          git -c user.name=ci -c user.email=ci@example.com add -A
+          git -c user.name=ci -c user.email=ci@example.com commit -qm "Windows screenshots ${{ github.sha }}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" shots-windows
 
   macos:
     runs-on: macos-latest   # Apple Silicon (M1/M2/M3/M4)
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller
-      - run: pyinstaller LANChat.spec
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --noconfirm LANChat.spec
       - run: cd dist && ditto -c -k --keepParent LANChat.app LANChat-mac.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: LANChat-Mac
           path: dist/LANChat-mac.zip
+      - name: Self-test with screenshots
+        run: |
+          mkdir -p shots
+          set +e
+          LANCHAT_SELFTEST="$PWD/shots" ./dist/LANChat.app/Contents/MacOS/LANChat
+          code=$?
+          echo "exit code: $code"
+          cat shots/selftest.json 2>/dev/null
+          exit $code
+      - name: Publish screenshots
+        if: always()
+        run: |
+          [ -d shots ] || exit 0
+          cd shots
+          git init -q -b shots-mac
+          git -c user.name=ci -c user.email=ci@example.com add -A
+          git -c user.name=ci -c user.email=ci@example.com commit -qm "Mac screenshots ${{ github.sha }}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" shots-mac

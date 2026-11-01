@@ -1,57 +1,97 @@
 """
-LAN Chat — простой мессенджер для компьютеров в одной Wi-Fi сети.
-Работает на Windows и macOS.
+LAN Chat 2.0 — мессенджер для компьютеров в одной Wi-Fi сети (Windows и macOS).
 
-Запуск из исходника:  python lanchat.py   (на Mac: python3 lanchat.py)
-Флаг --minimized — запуск свернутым (используется автозапуском).
+Интерфейс — HTML/CSS в собственном окне приложения (pywebview), не в браузере.
+Возможности: автопоиск собеседника, всплывающие уведомления поверх всех окон,
+реакции эмодзи, светлая/тёмная тема, режим «без звука», автозапуск, история.
+
+Запуск из исходника:  pip install pywebview  и  python lanchat.py
 """
 import json
 import os
 import platform
 import plistlib
-import queue
 import socket
 import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import messagebox, scrolledtext, simpledialog
+import uuid
+
+import webview
 
 APP_NAME = "LANChat"
-TCP_PORT = 50505          # порт для сообщений
-UDP_PORT = 50506          # порт для автопоиска собеседников
 APP_ID = "lanchat"
-MY_NAME = socket.gethostname().split(".")[0]
+TCP_PORT = 50505
+UDP_PORT = 50506
 IS_MAC = platform.system() == "Darwin"
 IS_WIN = os.name == "nt"
 
-events = queue.Queue()    # события из сетевых потоков -> в окно
-peers = {}                # ip -> имя компьютера
+SELFTEST_DIR = os.environ.get("LANCHAT_SELFTEST")       # режим самопроверки для сборки
+DATA_DIR = SELFTEST_DIR or os.path.expanduser("~")
+SETTINGS_PATH = os.path.join(DATA_DIR, ".lanchat.json")
+HISTORY_PATH = os.path.join(DATA_DIR, ".lanchat_history.json")
+HISTORY_LIMIT = 1000
 
-SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".lanchat.json")
+lock = threading.RLock()
 
 
-def load_settings():
+# ---------- Хранение ----------
+
+def load_json(path, default):
     try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
-        return {}
+        return default
 
 
-def save_settings(data):
+def save_json(path, data):
+    tmp = path + ".tmp"
     try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
     except OSError:
         pass
+
+
+settings = load_json(SETTINGS_PATH, {})
+if not isinstance(settings, dict):
+    settings = {}
+settings.setdefault("uid", uuid.uuid4().hex)
+settings.setdefault("name", socket.gethostname().split(".")[0])
+settings.setdefault("theme", "system")
+settings.setdefault("mute_until", 0)
+save_json(SETTINGS_PATH, settings)
+
+messages = load_json(HISTORY_PATH, [])
+if not isinstance(messages, list):
+    messages = []
+peers = {}            # ip -> имя
+
+
+def save_settings():
+    save_json(SETTINGS_PATH, settings)
+
+
+def save_history():
+    with lock:
+        del messages[:-HISTORY_LIMIT]
+        save_json(HISTORY_PATH, messages)
+
+
+def find_msg(msg_id):
+    for m in reversed(messages):
+        if m.get("id") == msg_id:
+            return m
+    return None
 
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("10.255.255.255", 1))   # пакет не отправляется
+        s.connect(("10.255.255.255", 1))
         return s.getsockname()[0]
     except OSError:
         return "127.0.0.1"
@@ -62,10 +102,30 @@ def get_local_ip():
 MY_IP = get_local_ip()
 
 
-def add_peer(ip, name):
-    if peers.get(ip) != name:
-        peers[ip] = name
-        events.put(("peers", None))
+def system_is_dark():
+    try:
+        if IS_MAC:
+            r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                               capture_output=True, text=True, timeout=2)
+            return "Dark" in r.stdout
+        if IS_WIN:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except Exception:
+        pass
+    return False
+
+
+def resolved_dark():
+    t = settings.get("theme", "system")
+    return t == "dark" or (t == "system" and system_is_dark())
+
+
+def is_muted():
+    mu = settings.get("mute_until", 0)
+    return mu == -1 or time.time() < mu
 
 
 # ---------- Автозапуск ----------
@@ -75,14 +135,13 @@ MAC_PLIST = os.path.expanduser("~/Library/LaunchAgents/com.lanchat.app.plist")
 
 
 def launch_command():
-    """Команда, которой система запустит программу при входе."""
-    if getattr(sys, "frozen", False):          # собранное приложение
+    if getattr(sys, "frozen", False):
         return [sys.executable]
     exe = sys.executable
     if IS_WIN:
         pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
         if os.path.exists(pyw):
-            exe = pyw                          # без чёрного окна консоли
+            exe = pyw
     return [exe, os.path.abspath(__file__)]
 
 
@@ -116,25 +175,156 @@ def set_autostart(enabled):
         if enabled:
             os.makedirs(os.path.dirname(MAC_PLIST), exist_ok=True)
             with open(MAC_PLIST, "wb") as f:
-                plistlib.dump({
-                    "Label": "com.lanchat.app",
-                    "ProgramArguments": cmd,
-                    "RunAtLoad": True,
-                    "LimitLoadToSessionType": "Aqua",
-                }, f)
+                plistlib.dump({"Label": "com.lanchat.app", "ProgramArguments": cmd,
+                               "RunAtLoad": True, "LimitLoadToSessionType": "Aqua"}, f)
         elif os.path.exists(MAC_PLIST):
             os.remove(MAC_PLIST)
 
 
+# ---------- Окна ----------
+
+class UI:
+    main = None
+    popup = None
+    ready = False
+    quitting = False
+
+
+ui = UI()
+
+
+def push(event):
+    """Отправить событие в интерфейс."""
+    w = ui.main
+    if w is None or not ui.ready:
+        return
+    try:
+        w.evaluate_js("window.app && app.onEvent(%s)" % json.dumps(event))
+    except Exception:
+        pass
+
+
+def main_has_focus():
+    try:
+        return bool(ui.main.evaluate_js("document.hasFocus() && !document.hidden"))
+    except Exception:
+        return False
+
+
+def restore_main():
+    w = ui.main
+    if w is None:
+        return
+    try:
+        w.restore()
+        w.show()
+    except Exception:
+        pass
+    push({"t": "focus"})
+
+
+def play_sound():
+    try:
+        if IS_MAC:
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif IS_WIN:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+    except Exception:
+        pass
+
+
+def close_popup(target=None):
+    with lock:
+        p = ui.popup
+        if p is None or (target is not None and p is not target):
+            return
+        ui.popup = None
+    try:
+        p.destroy()
+    except Exception:
+        pass
+
+
+class PopupApi:
+    def open_main(self):
+        close_popup()
+        restore_main()
+
+
+def show_popup(name, text):
+    close_popup()
+    w, h = 340, 100
+    try:
+        scr = webview.screens[0]
+        sw, sh = scr.width, scr.height
+    except Exception:
+        sw, sh = 1440, 900
+    x = sw - w - 16
+    y = 38 if IS_MAC else sh - h - 56
+    data = json.dumps({"name": name, "text": text, "theme": settings.get("theme", "system")})
+    html = POPUP_HTML.replace("__DATA__", data.replace("</", "<\\/"))
+    p = webview.create_window(
+        "LAN Chat", html=html, width=w, height=h, x=x, y=y,
+        frameless=True, easy_drag=False, on_top=True, focus=False, resizable=False,
+        js_api=PopupApi(), background_color="#1F1F23" if resolved_dark() else "#FFFFFF")
+    with lock:
+        ui.popup = p
+    threading.Timer(7, close_popup, args=(p,)).start()
+
+
+def notify(name, text):
+    if is_muted() or main_has_focus():
+        return
+    play_sound()
+    show_popup(name, text)
+
+
+def quit_app():
+    ui.quitting = True
+    close_popup()
+    try:
+        ui.main.destroy()
+    except Exception:
+        os._exit(0)
+
+
+def on_closing():
+    if ui.quitting:
+        return True
+    # крестик сворачивает окно: сообщения продолжают приходить
+    threading.Thread(target=lambda: ui.main.minimize(), daemon=True).start()
+    return False
+
+
+def on_loaded():
+    ui.ready = True
+    if SELFTEST_DIR:
+        threading.Thread(target=selftest, daemon=True).start()
+
+
 # ---------- Сеть ----------
 
+def peers_list():
+    with lock:
+        return [{"ip": ip, "name": n} for ip, n in peers.items()]
+
+
+def add_peer(ip, name):
+    with lock:
+        if peers.get(ip) == name:
+            return
+        peers[ip] = name
+    push({"t": "peers", "peers": peers_list()})
+
+
 def udp_announcer():
-    """Каждые 3 секунды сообщает в сеть: «я здесь»."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    msg = json.dumps({"app": APP_ID, "name": MY_NAME}).encode()
     subnet_bcast = MY_IP.rsplit(".", 1)[0] + ".255"
     while True:
+        msg = json.dumps({"app": APP_ID, "uid": settings["uid"], "name": settings["name"]}).encode()
         for addr in ("255.255.255.255", subnet_bcast):
             try:
                 s.sendto(msg, (addr, UDP_PORT))
@@ -144,23 +334,38 @@ def udp_announcer():
 
 
 def udp_listener():
-    """Слушает объявления других компьютеров."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("", UDP_PORT))
     except OSError:
-        return                                  # автопоиск недоступен, остаётся ручной IP
+        return
     while True:
         try:
             data, (ip, _) = s.recvfrom(2048)
-            if ip == MY_IP:
-                continue
             info = json.loads(data.decode())
-            if info.get("app") == APP_ID:
-                add_peer(ip, info.get("name", ip))
-        except (OSError, ValueError):
+            if info.get("app") == APP_ID and info.get("uid") != settings["uid"]:
+                add_peer(ip, str(info.get("name", ip))[:40])
+        except (OSError, ValueError, AttributeError):
             continue
+
+
+def apply_reaction(msg_id, emoji, uid, on):
+    with lock:
+        m = find_msg(msg_id)
+        if m is None:
+            return None
+        reactions = m.setdefault("reactions", {})
+        users = reactions.setdefault(emoji, [])
+        if on and uid not in users:
+            users.append(uid)
+        if not on and uid in users:
+            users.remove(uid)
+        if not users:
+            del reactions[emoji]
+        result = dict(reactions)
+    save_history()
+    return result
 
 
 def handle_client(conn, ip):
@@ -168,22 +373,49 @@ def handle_client(conn, ip):
     try:
         conn.settimeout(5)
         while True:
-            b = conn.recv(4096)
+            b = conn.recv(65536)
             if not b:
                 break
             chunks.append(b)
-        msg = json.loads(b"".join(chunks).decode())
+        data = json.loads(b"".join(chunks).decode())
     except (OSError, ValueError):
         return
     finally:
         conn.close()
-    name = msg.get("name", ip)
-    add_peer(ip, name)
-    events.put(("msg", (name, msg.get("text", ""))))
+    if not isinstance(data, dict):
+        return
+    kind = data.get("type")
+
+    if kind == "show":                                   # повторный запуск программы
+        if ip in ("127.0.0.1", MY_IP):
+            restore_main()
+        return
+
+    if kind == "msg":
+        m = {"id": str(data.get("id", uuid.uuid4().hex))[:64],
+             "uid": str(data.get("uid", ""))[:64],
+             "name": str(data.get("name", ip))[:40],
+             "text": str(data.get("text", ""))[:10000],
+             "ts": time.time(), "mine": False, "reactions": {}}
+        with lock:
+            if find_msg(m["id"]):
+                return
+            messages.append(m)
+        save_history()
+        add_peer(ip, m["name"])
+        push({"t": "msg", "msg": m})
+        notify(m["name"], m["text"])
+
+    elif kind == "react":
+        emoji = str(data.get("emoji", ""))[:16]
+        if not emoji:
+            return
+        r = apply_reaction(str(data.get("id", "")), emoji, str(data.get("uid", "")), bool(data.get("on")))
+        if r is not None:
+            push({"t": "react", "id": data.get("id"), "reactions": r})
 
 
 def open_server_socket():
-    """Открывает порт сообщений. Если занят — программа уже запущена."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     if IS_WIN:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
@@ -200,245 +432,242 @@ def tcp_server(srv):
         threading.Thread(target=handle_client, args=(conn, ip), daemon=True).start()
 
 
-def send_message(text):
-    targets = dict(peers)
-    if not targets:
-        events.put(("info", "Собеседник не найден. Проверьте, что программа запущена на втором компьютере."))
-        return
-    payload = json.dumps({"name": MY_NAME, "text": text}).encode()
-    for ip, name in targets.items():
+def send_payload(payload):
+    """Отправляет всем собеседникам. Возвращает True, если хоть кто-то получил."""
+    raw = json.dumps(payload, ensure_ascii=False).encode()
+    delivered = False
+    for p in peers_list():
         try:
-            with socket.create_connection((ip, TCP_PORT), timeout=3) as s:
-                s.sendall(payload)
+            with socket.create_connection((p["ip"], TCP_PORT), timeout=3) as s:
+                s.sendall(raw)
+            delivered = True
         except OSError:
-            events.put(("info", f"Не удалось доставить сообщение на {name} ({ip})"))
-
-
-# ---------- Окно ----------
-
-class ChatApp:
-    def __init__(self, root, start_minimized=False):
-        self.root = root
-        self.popup = None
-        root.title(f"LAN Chat — {MY_NAME}")
-        root.geometry("460x540")
-        root.minsize(320, 300)
-        root.protocol("WM_DELETE_WINDOW", self.hide)   # крестик сворачивает, не закрывает
-        if IS_MAC:
-            # клик по иконке в Dock снова открывает окно
-            root.createcommand("::tk::mac::ReopenApplication", self.show)
-
-        top = tk.Frame(root)
-        top.pack(fill="x", padx=8, pady=(8, 0))
-        self.status = tk.Label(top, anchor="w", fg="#555")
-        self.status.pack(side="left", fill="x", expand=True)
-
-        bar = tk.Frame(root)
-        bar.pack(fill="x", padx=8, pady=4)
-        self.autostart_var = tk.BooleanVar(value=autostart_enabled())
-        tk.Checkbutton(bar, text="Запускать при входе в систему",
-                       variable=self.autostart_var,
-                       command=self.toggle_autostart).pack(side="left")
-        tk.Button(bar, text="Выход", command=root.destroy).pack(side="right")
-        tk.Button(bar, text="Добавить IP", command=self.add_ip).pack(side="right", padx=4)
-
-        # Без звука: 0 = звук включён, -1 = выключен бессрочно, иначе — до этого момента
-        self.settings = load_settings()
-        self.mute_until = self.settings.get("mute_until", 0)
-        mute_bar = tk.Frame(root)
-        mute_bar.pack(fill="x", padx=8, pady=(0, 4))
-        self.mute_btn = tk.Menubutton(mute_bar, relief="raised", padx=8)
-        menu = tk.Menu(self.mute_btn, tearoff=False)
-        menu.add_command(label="Включить звук и уведомления", command=lambda: self.set_mute(0))
-        menu.add_separator()
-        menu.add_command(label="Без звука на 1 час", command=lambda: self.set_mute(time.time() + 3600))
-        menu.add_command(label="Без звука на 8 часов", command=lambda: self.set_mute(time.time() + 8 * 3600))
-        menu.add_command(label="Без звука до завтра (8:00)", command=lambda: self.set_mute(self.tomorrow_8am()))
-        menu.add_command(label="Без звука, пока не включу", command=lambda: self.set_mute(-1))
-        self.mute_btn.config(menu=menu)
-        self.mute_btn.pack(side="left")
-        self.mute_text = None
-        self.update_mute_label()
-
-        self.log = scrolledtext.ScrolledText(root, wrap="word", state="disabled",
-                                             font=("Helvetica", 12))
-        self.log.pack(fill="both", expand=True, padx=8)
-        self.log.tag_config("me", foreground="#1a5fb4")
-        self.log.tag_config("them", foreground="#26a269")
-        self.log.tag_config("info", foreground="#999")
-
-        bottom = tk.Frame(root)
-        bottom.pack(fill="x", padx=8, pady=8)
-        self.entry = tk.Entry(bottom, font=("Helvetica", 12))
-        self.entry.pack(side="left", fill="x", expand=True)
-        self.entry.bind("<Return>", lambda e: self.send())
-        tk.Button(bottom, text="Отправить", command=self.send).pack(side="right", padx=(6, 0))
-        self.entry.focus_set()
-
-        self.update_status()
-        self.write("info", f"Мой адрес: {MY_IP}. Ищу собеседника в сети…")
-        root.after(200, self.poll)
-        if start_minimized:
-            root.after(100, root.iconify)
-
-    # ----- Без звука -----
-
-    @staticmethod
-    def tomorrow_8am():
-        t = time.localtime(time.time() + 86400)
-        return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 8, 0, 0, 0, 0, -1))
-
-    def is_muted(self):
-        return self.mute_until == -1 or time.time() < self.mute_until
-
-    def set_mute(self, until):
-        self.mute_until = until
-        self.settings["mute_until"] = until
-        save_settings(self.settings)
-        self.update_mute_label()
-        self.write("info", "Звук и уведомления включены" if until == 0
-                   else f"Режим без звука: {self.mute_text.lower()}")
-
-    def update_mute_label(self):
-        if not self.is_muted():
-            self.mute_until = 0
-            text = "Звук: вкл"
-        elif self.mute_until == -1:
-            text = "Без звука"
-        else:
-            fmt = "%H:%M" if time.localtime(self.mute_until).tm_mday == time.localtime().tm_mday else "%d.%m %H:%M"
-            text = "Без звука до " + time.strftime(fmt, time.localtime(self.mute_until))
-        if text != self.mute_text:
-            self.mute_text = text
-            self.mute_btn.config(text=text + "  ▾")
-            mark = "" if text == "Звук: вкл" else " [без звука]"
-            self.root.title(f"LAN Chat — {MY_NAME}{mark}")
-
-    def toggle_autostart(self):
-        want = self.autostart_var.get()
-        try:
-            set_autostart(want)
-            self.write("info", "Автозапуск включён" if want else "Автозапуск выключен")
-        except OSError as e:
-            self.autostart_var.set(not want)
-            messagebox.showerror("Автозапуск", f"Не удалось изменить настройку:\n{e}")
-
-    def write(self, tag, text):
-        self.log.config(state="normal")
-        self.log.insert("end", text + "\n", tag)
-        self.log.config(state="disabled")
-        self.log.see("end")
-
-    def update_status(self):
-        if peers:
-            names = ", ".join(f"{n} ({ip})" for ip, n in peers.items())
-            self.status.config(text=f"В сети: {names}")
-        else:
-            self.status.config(text="Собеседник пока не найден")
-
-    def send(self):
-        text = self.entry.get().strip()
-        if not text:
-            return
-        self.entry.delete(0, "end")
-        self.write("me", f"[{time.strftime('%H:%M')}] Я: {text}")
-        threading.Thread(target=send_message, args=(text,), daemon=True).start()
-
-    def add_ip(self):
-        ip = simpledialog.askstring("Добавить вручную",
-                                    "IP-адрес второго компьютера\n(он показан в его окне):",
-                                    parent=self.root)
-        if ip:
-            add_peer(ip.strip(), ip.strip())
-
-    def hide(self):
-        self.root.iconify()
-
-    def show(self):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
-        self.entry.focus_set()
-
-    def app_has_focus(self):
-        try:
-            return self.root.focus_get() is not None and self.root.state() == "normal"
-        except (KeyError, tk.TclError):
-            return False
-
-    def notify(self, name, text):
-        """Всплывающее окошко поверх всех программ."""
-        if self.is_muted():
-            return                            # сообщение есть в чате, но без звука и окошка
-        self.root.bell()
-        if self.app_has_focus():
-            return
-        if self.popup is not None:
-            try:
-                self.popup.destroy()
-            except tk.TclError:
-                pass
-
-        p = tk.Toplevel(self.root)
-        self.popup = p
-        if not IS_MAC:
-            p.overrideredirect(True)          # без рамки на Windows
-        else:
-            p.title("Новое сообщение")
-        p.attributes("-topmost", True)
-        p.configure(bg="#2b2d31")
-
-        w, h = 330, 110
-        sw, sh = p.winfo_screenwidth(), p.winfo_screenheight()
-        x = sw - w - 20
-        y = 40 if IS_MAC else sh - h - 60     # Mac: справа вверху, Windows: над панелью задач
-        p.geometry(f"{w}x{h}+{x}+{y}")
-
-        short = text if len(text) <= 120 else text[:117] + "…"
-        tk.Label(p, text=name, bg="#2b2d31", fg="#ffffff", anchor="w",
-                 font=("Helvetica", 12, "bold")).pack(fill="x", padx=12, pady=(10, 2))
-        tk.Label(p, text=short, bg="#2b2d31", fg="#dddddd", anchor="nw", justify="left",
-                 wraplength=w - 24, font=("Helvetica", 11)).pack(fill="both", expand=True, padx=12)
-
-        def open_chat(_=None):
-            p.destroy()
-            self.show()
-
-        for widget in [p] + list(p.winfo_children()):
-            widget.bind("<Button-1>", open_chat)
-        p.after(8000, lambda: p.winfo_exists() and p.destroy())
-
-    def poll(self):
-        try:
-            while True:
-                kind, data = events.get_nowait()
-                if kind == "msg":
-                    name, text = data
-                    self.write("them", f"[{time.strftime('%H:%M')}] {name}: {text}")
-                    self.notify(name, text)
-                elif kind == "peers":
-                    self.update_status()
-                elif kind == "info":
-                    self.write("info", data)
-        except queue.Empty:
             pass
-        self.update_mute_label()               # таймер «без звука» истёк — вернуть звук
-        self.root.after(200, self.poll)
+    return delivered
 
+
+def deliver(m):
+    ok = send_payload({"type": "msg", "id": m["id"], "uid": settings["uid"],
+                       "name": settings["name"], "text": m["text"]})
+    with lock:
+        if ok:
+            m.pop("failed", None)
+        else:
+            m["failed"] = True
+    save_history()
+    if not ok:
+        push({"t": "failed", "id": m["id"]})
+
+
+# ---------- Мост «интерфейс → программа» ----------
+
+class Api:
+    def get_state(self):
+        with lock:
+            return {"me": {"uid": settings["uid"], "name": settings["name"]},
+                    "messages": list(messages), "peers": peers_list(),
+                    "theme": settings.get("theme", "system"),
+                    "mute_until": settings.get("mute_until", 0),
+                    "autostart": autostart_enabled(), "ip": MY_IP}
+
+    def send(self, text):
+        text = str(text or "").strip()[:10000]
+        if not text:
+            return None
+        m = {"id": uuid.uuid4().hex, "uid": settings["uid"], "name": settings["name"],
+             "text": text, "ts": time.time(), "mine": True, "reactions": {}}
+        with lock:
+            messages.append(m)
+        save_history()
+        threading.Thread(target=deliver, args=(m,), daemon=True).start()
+        return m
+
+    def resend(self, msg_id):
+        with lock:
+            m = find_msg(msg_id)
+        if m and m.get("mine"):
+            threading.Thread(target=deliver, args=(m,), daemon=True).start()
+            return True
+        return False
+
+    def react(self, msg_id, emoji):
+        emoji = str(emoji)[:16]
+        with lock:
+            m = find_msg(msg_id)
+            if m is None:
+                return None
+            on = settings["uid"] not in m.get("reactions", {}).get(emoji, [])
+        r = apply_reaction(msg_id, emoji, settings["uid"], on)
+        threading.Thread(target=send_payload, daemon=True, args=(
+            {"type": "react", "id": msg_id, "emoji": emoji, "uid": settings["uid"], "on": on},)).start()
+        return r
+
+    def set_theme(self, theme):
+        if theme in ("light", "dark", "system"):
+            settings["theme"] = theme
+            save_settings()
+        return settings["theme"]
+
+    def set_mute(self, kind):
+        now = time.time()
+        if kind == "1h":
+            until = now + 3600
+        elif kind == "8h":
+            until = now + 8 * 3600
+        elif kind == "tomorrow":
+            t = time.localtime(now + 86400)
+            until = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 8, 0, 0, 0, 0, -1))
+        elif kind == "forever":
+            until = -1
+        else:
+            until = 0
+        settings["mute_until"] = until
+        save_settings()
+        return until
+
+    def set_autostart(self, on):
+        try:
+            set_autostart(bool(on))
+        except OSError:
+            pass
+        return autostart_enabled()
+
+    def set_name(self, name):
+        name = str(name or "").strip()[:40]
+        if name:
+            settings["name"] = name
+            save_settings()
+        return settings["name"]
+
+    def add_peer(self, ip):
+        ip = str(ip or "").strip()
+        try:
+            socket.inet_aton(ip)
+        except OSError:
+            return False
+        add_peer(ip, ip)
+        return True
+
+    def quit(self):
+        threading.Thread(target=quit_app, daemon=True).start()
+
+
+# ---------- Самопроверка (для автоматической сборки) ----------
+
+def screenshot(name):
+    path = os.path.join(SELFTEST_DIR, name + ".png")
+    try:
+        if IS_MAC:
+            subprocess.run(["screencapture", "-x", path], timeout=20)
+        elif IS_WIN:
+            ps = ("Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+                  "$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds;"
+                  "$bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height;"
+                  "$g=[System.Drawing.Graphics]::FromImage($bmp);"
+                  "$g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size);"
+                  f"$bmp.Save('{path}')")
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps], timeout=30,
+                           creationflags=0x08000000)
+    except Exception:
+        pass
+
+
+def selftest():
+    result = {"checks": {}}
+    checks = result["checks"]
+
+    def watchdog():
+        time.sleep(150)
+        result["error"] = "timeout"
+        save_json(os.path.join(SELFTEST_DIR, "selftest.json"), result)
+        os._exit(3)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    try:
+        time.sleep(2.5)
+        now = time.time()
+        me, peer = settings["uid"], "peer-demo"
+        demo = [
+            (now - 26 * 3600, False, "Ноутбук", "Привет! Не забудь, завтра созвон в 10:00", {"👍": [me]}),
+            (now - 25.9 * 3600, True, settings["name"], "Помню, спасибо!", {}),
+            (now - 180, True, settings["name"], "Можешь скинуть отчёт по продажам за октябрь?", {}),
+            (now - 120, False, "Ноутбук", "Да, через 10 минут пришлю.\nТам ещё добавила сравнение с сентябрём 📊",
+             {"🔥": [me], "❤️": [peer, me]}),
+            (now - 30, True, settings["name"], "Супер, жду 🙌", {"😂": [peer]}),
+        ]
+        with lock:
+            messages.clear()
+            for ts, mine, name, text, reacts in demo:
+                messages.append({"id": uuid.uuid4().hex, "uid": me if mine else peer, "name": name,
+                                 "text": text, "ts": ts, "mine": mine, "reactions": reacts})
+            peers["192.168.1.24"] = "Ноутбук"
+        push({"t": "reload"})
+        time.sleep(2)
+
+        ev = ui.main.evaluate_js
+        checks["messages_rendered"] = ev("document.querySelectorAll('.msg').length") == len(demo)
+        checks["reaction_chips"] = (ev("document.querySelectorAll('.chip').length") or 0) >= 4
+        checks["day_separators"] = ev("document.querySelectorAll('.day').length") == 2
+
+        ev("app.applyTheme('light')")
+        time.sleep(1.2)
+        screenshot("1-light")
+
+        target = messages[3]["id"]
+        before = "😮" in messages[3]["reactions"]
+        Api().react(target, "😮")
+        time.sleep(0.8)
+        checks["reaction_toggle"] = (not before) and "😮" in messages[3]["reactions"]
+        checks["reaction_shown"] = bool(ev("[...document.querySelectorAll('.chip')].some(c => c.textContent.includes('😮'))"))
+
+        ev("document.querySelectorAll('.msg.them .act-react')[1].click()")
+        time.sleep(0.8)
+        checks["picker_opens"] = bool(ev("!!document.querySelector('.picker')"))
+        screenshot("2-light-picker")
+        ev("app.closeAll()")
+
+        ev("app.applyTheme('dark')")
+        time.sleep(1.2)
+        screenshot("3-dark")
+        checks["dark_theme"] = ev("document.documentElement.dataset.theme") == "dark"
+
+        ev("document.getElementById('btn-more').click()")
+        time.sleep(0.6)
+        screenshot("4-dark-menu")
+        ev("app.closeAll()")
+
+        show_popup("Ноутбук", "Привет! Это уведомление поверх всех окон 👋")
+        time.sleep(2.5)
+        checks["popup"] = ui.popup is not None
+        screenshot("5-popup")
+        result["ok"] = all(checks.values())
+    except Exception as e:
+        result["ok"] = False
+        result["error"] = repr(e)
+    save_json(os.path.join(SELFTEST_DIR, "selftest.json"), result)
+    code = 0 if result.get("ok") else 1
+    quit_app()
+    time.sleep(3)
+    os._exit(code)
+
+
+# ---------- Запуск ----------
 
 def main():
     try:
         srv = open_server_socket()
     except OSError:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo("LAN Chat", "LAN Chat уже запущен.")
+        # программа уже запущена — просто показываем её окно
+        try:
+            with socket.create_connection(("127.0.0.1", TCP_PORT), timeout=2) as s:
+                s.sendall(json.dumps({"type": "show"}).encode())
+        except OSError:
+            pass
         return
 
-    # если программу переместили, обновляем путь в автозапуске
-    if autostart_enabled():
+    if autostart_enabled() and not SELFTEST_DIR:
         try:
-            set_autostart(True)
+            set_autostart(True)          # обновить путь, если программу переместили
         except OSError:
             pass
 
@@ -446,9 +675,510 @@ def main():
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=udp_announcer, daemon=True).start()
 
-    root = tk.Tk()
-    ChatApp(root, start_minimized="--minimized" in sys.argv)
-    root.mainloop()
+    ui.main = webview.create_window(
+        "LAN Chat", html=MAIN_HTML, js_api=Api(), width=540, height=740, min_size=(380, 480),
+        minimized="--minimized" in sys.argv,
+        background_color="#161618" if resolved_dark() else "#FFFFFF")
+    ui.main.events.closing += on_closing
+    ui.main.events.loaded += on_loaded
+    webview.start()
+    os._exit(0)
+
+
+# ---------- Интерфейс ----------
+
+POPUP_HTML = r"""<!doctype html><html data-theme="system"><head><meta charset="utf-8"><style>
+:root{--bg:#fff;--text:#18181b;--muted:#71717a;--line:#e4e4e7;--accent:#2563eb}
+html[data-theme=dark]{--bg:#1f1f23;--text:#f4f4f5;--muted:#a1a1aa;--line:#33333a;--accent:#5b8cff}
+@media (prefers-color-scheme:dark){html[data-theme=system]{--bg:#1f1f23;--text:#f4f4f5;--muted:#a1a1aa;--line:#33333a;--accent:#5b8cff}}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);cursor:pointer;
+ font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+ -webkit-user-select:none;user-select:none;-webkit-font-smoothing:antialiased}
+.w{box-sizing:border-box;height:100%;border:1px solid var(--line);border-left:3px solid var(--accent);
+ padding:11px 14px;display:flex;flex-direction:column;justify-content:center;gap:3px}
+.top{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted)}
+.n{font-weight:600;font-size:14px;color:var(--text)}
+.t{font-size:13.5px;line-height:1.35;color:var(--text);opacity:.85;display:-webkit-box;
+ -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap}
+</style></head><body><div class="w"><div class="top"><span>LAN Chat</span><span>сейчас</span></div>
+<div class="n" id="n"></div><div class="t" id="t"></div></div>
+<script>
+const D=__DATA__;
+document.documentElement.dataset.theme=D.theme;
+document.getElementById('n').textContent=D.name;
+document.getElementById('t').textContent=D.text;
+document.body.addEventListener('click',()=>{if(window.pywebview&&pywebview.api)pywebview.api.open_main()});
+</script></body></html>"""
+
+MAIN_HTML = r"""<!doctype html>
+<html lang="ru" data-theme="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LAN Chat</title>
+<style>
+:root{
+  --bg:#ffffff;--text:#18181b;--muted:#8b8b93;--line:#ececee;--mine:#f4f4f5;--hover:#f1f1f3;
+  --chip:#f4f4f5;--chip-on:#eaf0ff;--chip-on-line:#bccdfa;--accent:#2563eb;--input:#f7f7f8;
+  --danger:#d93025;--menu:#ffffff;--online:#22a06b;--overlay:rgba(0,0,0,.25);
+  --shadow:0 10px 30px rgba(0,0,0,.12),0 1px 3px rgba(0,0,0,.08);
+}
+html[data-theme=dark]{
+  --bg:#161618;--text:#ececef;--muted:#8d8d96;--line:#29292e;--mine:#242428;--hover:#26262b;
+  --chip:#232327;--chip-on:#1d2846;--chip-on-line:#34508f;--accent:#5b8cff;--input:#1e1e22;
+  --danger:#ff6b5e;--menu:#222226;--online:#3ecf8e;--overlay:rgba(0,0,0,.5);
+  --shadow:0 10px 30px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.4);
+}
+@media (prefers-color-scheme:dark){html[data-theme=system]{
+  --bg:#161618;--text:#ececef;--muted:#8d8d96;--line:#29292e;--mine:#242428;--hover:#26262b;
+  --chip:#232327;--chip-on:#1d2846;--chip-on-line:#34508f;--accent:#5b8cff;--input:#1e1e22;
+  --danger:#ff6b5e;--menu:#222226;--online:#3ecf8e;--overlay:rgba(0,0,0,.5);
+  --shadow:0 10px 30px rgba(0,0,0,.5),0 1px 3px rgba(0,0,0,.4);
+}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);display:flex;flex-direction:column;overflow:hidden;
+  font:15px/1.45 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+svg{display:block}
+
+/* шапка */
+header{display:flex;align-items:center;gap:12px;padding:10px 14px 10px 16px;border-bottom:1px solid var(--line)}
+.avatar{width:34px;height:34px;border-radius:50%;background:var(--mine);display:grid;place-items:center;
+  font-weight:600;font-size:14px;flex:none}
+.who{flex:1;min-width:0}
+.who-name{font-weight:600;font-size:14.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.who-status{font-size:12.5px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--muted);opacity:.6}
+.dot.on{background:var(--online);opacity:1}
+.icon-btn{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;color:var(--muted);
+  transition:background .12s,color .12s}
+.icon-btn:hover,.icon-btn.active{background:var(--hover);color:var(--text)}
+.icon-btn.muted-on{color:var(--danger)}
+
+/* лента */
+#feed{flex:1;overflow-y:auto;scroll-behavior:smooth}
+#feed::-webkit-scrollbar{width:10px}
+#feed::-webkit-scrollbar-thumb{background:var(--line);border-radius:10px;border:3px solid var(--bg)}
+.col{max-width:720px;margin:0 auto;padding:12px 22px 10px}
+.day{display:flex;align-items:center;gap:14px;margin:18px 0 16px;color:var(--muted);
+  font-size:11.5px;letter-spacing:.08em;text-transform:uppercase}
+.day::before,.day::after{content:"";flex:1;height:1px;background:var(--line)}
+.msg{display:flex;flex-direction:column;margin:4px 0 16px;animation:in .18s ease-out}
+@keyframes in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.msg.them{align-items:flex-start}
+.msg.mine{align-items:flex-end}
+.bubble{max-width:82%}
+.mine .bubble{background:var(--mine);border-radius:14px;padding:10px 14px 11px;max-width:78%}
+.meta{font-size:13.5px;color:var(--muted);margin-bottom:3px;white-space:nowrap}
+.meta b{font-weight:500;color:var(--text)}
+.text{white-space:pre-wrap;overflow-wrap:anywhere;-webkit-user-select:text;user-select:text}
+.reactions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 9px;border-radius:999px;
+  background:var(--chip);border:1px solid transparent;font-size:14px;transition:transform .1s,background .12s}
+.chip:hover{transform:translateY(-1px)}
+.chip.on{background:var(--chip-on);border-color:var(--chip-on-line)}
+.chip .n{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+.chip.on .n{color:var(--accent)}
+.actions{display:flex;gap:2px;margin-top:6px;margin-left:-6px}
+.mine .actions{margin-left:0;margin-right:-6px;opacity:0;transition:opacity .12s}
+.msg.mine:hover .actions,.msg.mine .actions:focus-within{opacity:1}
+.act{width:28px;height:28px;border-radius:7px;display:grid;place-items:center;color:var(--muted)}
+.act:hover{background:var(--hover);color:var(--text)}
+.failed{font-size:12.5px;color:var(--danger);margin-top:5px;cursor:pointer}
+.failed:hover{text-decoration:underline}
+.empty{text-align:center;color:var(--muted);margin-top:28vh;font-size:14px}
+.empty b{display:block;color:var(--text);font-weight:600;font-size:15px;margin-bottom:4px}
+
+/* поле ввода */
+footer{padding:8px 16px 14px}
+.composer{max-width:720px;margin:0 auto;display:flex;align-items:flex-end;gap:4px;background:var(--input);
+  border:1px solid var(--line);border-radius:18px;padding:5px 5px 5px 14px;transition:border-color .15s}
+.composer:focus-within{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
+textarea{flex:1;border:0;background:transparent;color:var(--text);resize:none;outline:none;font:inherit;
+  padding:7px 0;max-height:160px;line-height:1.4}
+textarea::placeholder{color:var(--muted)}
+.send{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;
+  transition:opacity .15s,transform .1s}
+.send:disabled{opacity:.3;cursor:default}
+.send:not(:disabled):active{transform:scale(.94)}
+.hint{max-width:720px;margin:6px auto 0;text-align:center;font-size:11.5px;color:var(--muted)}
+
+/* всплывающие элементы */
+.menu{position:fixed;z-index:20;background:var(--menu);border:1px solid var(--line);border-radius:12px;
+  box-shadow:var(--shadow);padding:6px;min-width:250px;animation:pop .12s ease-out}
+@keyframes pop{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+.mi{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:8px 10px;border-radius:8px;font-size:14px}
+.mi:hover{background:var(--hover)}
+.mi .ic{color:var(--muted);flex:none}
+.mi .lb{flex:1}
+.mi .ck{color:var(--accent);flex:none}
+.mi.danger{color:var(--danger)}
+.mi.danger .ic{color:var(--danger)}
+.ml{padding:6px 10px 4px;font-size:12px;color:var(--muted)}
+.ms{height:1px;background:var(--line);margin:5px 4px}
+.picker{position:fixed;z-index:20;display:flex;gap:2px;padding:4px;background:var(--menu);border:1px solid var(--line);
+  border-radius:999px;box-shadow:var(--shadow);animation:pop .12s ease-out}
+.picker button{width:36px;height:36px;border-radius:50%;font-size:20px;display:grid;place-items:center;transition:transform .1s}
+.picker button:hover{background:var(--hover);transform:scale(1.18)}
+.picker button.on{background:var(--chip-on)}
+.grid{position:fixed;z-index:20;display:grid;grid-template-columns:repeat(8,34px);gap:2px;padding:8px;
+  background:var(--menu);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);animation:pop .12s ease-out}
+.grid button{width:34px;height:34px;border-radius:8px;font-size:19px}
+.grid button:hover{background:var(--hover)}
+.toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:var(--text);color:var(--bg);
+  font-size:13px;padding:8px 14px;border-radius:10px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:40}
+.toast.show{opacity:1}
+.overlay{position:fixed;inset:0;background:var(--overlay);display:grid;place-items:center;z-index:30;animation:fade .15s}
+@keyframes fade{from{opacity:0}}
+.dialog{width:min(360px,90vw);background:var(--menu);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow);padding:18px}
+.dialog h3{margin:0 0 4px;font-size:15px;font-weight:600}
+.dialog p{margin:0 0 12px;font-size:13px;color:var(--muted)}
+.dialog input{width:100%;font:inherit;color:var(--text);background:var(--input);border:1px solid var(--line);
+  border-radius:9px;padding:8px 11px;outline:none}
+.dialog input:focus{border-color:var(--accent)}
+.row{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+.btn{padding:7px 14px;border-radius:9px;font-size:14px}
+.btn.ghost:hover{background:var(--hover)}
+.btn.primary{background:var(--accent);color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <div class="avatar" id="avatar">·</div>
+  <div class="who">
+    <div class="who-name" id="peer-name">LAN Chat</div>
+    <div class="who-status"><span class="dot" id="dot"></span><span id="status">ищу собеседника в сети…</span></div>
+  </div>
+  <button class="icon-btn" id="btn-mute" title="Звук и уведомления"></button>
+  <button class="icon-btn" id="btn-theme" title="Тема"></button>
+  <button class="icon-btn" id="btn-more" title="Настройки"></button>
+</header>
+
+<main id="feed"><div class="col" id="col"></div></main>
+
+<footer>
+  <div class="composer">
+    <textarea id="ta" rows="1" placeholder="Сообщение…"></textarea>
+    <button class="icon-btn" id="btn-emoji" title="Эмодзи"></button>
+    <button class="send" id="btn-send" title="Отправить" disabled></button>
+  </div>
+  <div class="hint">Enter — отправить · Shift+Enter — новая строка</div>
+</footer>
+<div class="toast" id="toast"></div>
+
+<script>
+const REACTIONS=['👍','❤️','😂','😮','😢','🔥','🎉','👎'];
+const EMOJI=['😀','😂','🥲','😊','😍','😘','😎','🤔','😅','😉','🙃','😴','😭','😱','🤗','🥳',
+             '👍','👎','👏','🙏','💪','👋','🤝','🙌','❤️','🔥','🎉','✨','✅','❌','☕','💬'];
+const MONTHS=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
+const I={
+ smilePlus:'<path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/><path d="M16 5h6"/><path d="M19 2v6"/>',
+ smile:'<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/>',
+ copy:'<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+ bell:'<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
+ bellOff:'<path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/><path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="m2 2 20 20"/>',
+ sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+ moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+ monitor:'<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>',
+ more:'<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
+ send:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
+ check:'<path d="M20 6 9 17l-5-5"/>',
+ user:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+ plug:'<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a6 6 0 0 1-12 0V8Z"/>',
+ power:'<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
+ rocket:'<path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"/><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/>'
+};
+const svg=(n,s=18,w=1.75)=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round">${I[n]}</svg>`;
+const $=s=>document.querySelector(s);
+const el=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e};
+const api=()=>window.pywebview.api;
+const S={me:{uid:'',name:''},messages:[],peers:[],theme:'system',mute:0,autostart:false,ip:''};
+const feed=$('#feed'),col=$('#col'),ta=$('#ta');
+
+/* ---------- время ---------- */
+const now=()=>Date.now()/1000;
+const dayKey=ts=>new Date(ts*1000).toDateString();
+function dayLabel(ts){
+  const d=new Date(ts*1000),t=new Date(),y=new Date(Date.now()-864e5);
+  if(d.toDateString()===t.toDateString())return'Сегодня';
+  if(d.toDateString()===y.toDateString())return'Вчера';
+  return d.getDate()+' '+MONTHS[d.getMonth()]+(d.getFullYear()!==t.getFullYear()?' '+d.getFullYear():'');
+}
+const hhmm=ts=>new Date(ts*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+function rel(ts){
+  const s=now()-ts;
+  if(s<45)return'только что';
+  if(s<3600)return Math.round(s/60)+' мин назад';
+  return hhmm(ts);
+}
+
+/* ---------- лента ---------- */
+const findMsg=id=>S.messages.find(m=>m.id===id);
+function render(){
+  col.textContent='';
+  if(!S.messages.length){
+    const e=el('div','empty');e.append(el('b',null,'Пока нет сообщений'),
+      el('span',null,S.peers.length?'Напишите первым 👋':'Запустите LAN Chat на втором компьютере'));
+    col.append(e);return;
+  }
+  let last=null;
+  for(const m of S.messages){
+    if(dayKey(m.ts)!==last){col.append(el('div','day',dayLabel(m.ts)));last=dayKey(m.ts)}
+    col.append(msgEl(m));
+  }
+  feed.style.scrollBehavior='auto';feed.scrollTop=feed.scrollHeight;feed.style.scrollBehavior='';
+}
+function appendMsg(m){
+  if(col.querySelector('.empty')){render();return}
+  const nearBottom=feed.scrollHeight-feed.scrollTop-feed.clientHeight<120;
+  const prev=S.messages[S.messages.length-2];
+  if(!prev||dayKey(prev.ts)!==dayKey(m.ts))col.append(el('div','day',dayLabel(m.ts)));
+  col.append(msgEl(m));
+  if(m.mine||nearBottom)feed.scrollTop=feed.scrollHeight;
+}
+function msgEl(m){
+  const box=el('div','msg '+(m.mine?'mine':'them'));box.dataset.id=m.id;
+  const b=el('div','bubble'),meta=el('div','meta');
+  const t=el('span','time',rel(m.ts));t.dataset.ts=m.ts;t.title=dayLabel(m.ts)+', '+hhmm(m.ts);
+  meta.append(el('b',null,m.mine?'Я':m.name),document.createTextNode(' · '),t);
+  b.append(meta,el('div','text',m.text));box.append(b);
+  const r=el('div','reactions');fillReactions(r,m);box.append(r);
+  const a=el('div','actions');
+  const rb=el('button','act act-react');rb.title='Реакция';rb.innerHTML=svg('smilePlus',16);
+  rb.onclick=e=>{e.stopPropagation();openPicker(rb,m.id)};
+  const cb=el('button','act');cb.title='Копировать';cb.innerHTML=svg('copy',16);cb.onclick=()=>copy(m.text);
+  a.append(rb,cb);box.append(a);
+  if(m.failed)box.append(failedEl(m.id));
+  return box;
+}
+function failedEl(id){
+  const f=el('div','failed','Не доставлено · повторить');
+  f.onclick=async()=>{f.remove();const mm=findMsg(id);if(mm)mm.failed=false;await api().resend(id)};
+  return f;
+}
+function fillReactions(r,m){
+  r.textContent='';
+  for(const [e,users] of Object.entries(m.reactions||{})){
+    if(!users.length)continue;
+    const c=el('button','chip'+(users.includes(S.me.uid)?' on':''));
+    c.append(el('span',null,e),el('span','n',String(users.length)));
+    c.title=users.includes(S.me.uid)?'Нажмите, чтобы убрать':'Нажмите, чтобы добавить';
+    c.onclick=()=>react(m.id,e);r.append(c);
+  }
+  r.style.display=r.children.length?'flex':'none';
+}
+function updateReactions(id){
+  const m=findMsg(id),box=col.querySelector(`.msg[data-id="${CSS.escape(id)}"] .reactions`);
+  if(m&&box)fillReactions(box,m);
+}
+async function react(id,e){
+  closeAll();
+  const r=await api().react(id,e);
+  const m=findMsg(id);if(r&&m){m.reactions=r;updateReactions(id)}
+}
+
+/* ---------- шапка и иконки ---------- */
+function isMuted(){return S.mute===-1||now()<S.mute}
+function renderHeader(){
+  const p=S.peers[0];
+  $('#peer-name').textContent=p?p.name:'LAN Chat';
+  $('#avatar').textContent=p?(p.name.trim()[0]||'·').toUpperCase():'·';
+  $('#dot').className='dot'+(p?' on':'');
+  $('#status').textContent=p?(S.peers.length>1?'в сети, ещё '+(S.peers.length-1):'в сети'):'ищу собеседника в сети…';
+}
+function renderIcons(){
+  const m=isMuted(),bm=$('#btn-mute');
+  bm.innerHTML=svg(m?'bellOff':'bell');bm.classList.toggle('muted-on',m);
+  bm.title=m?muteLabel():'Звук и уведомления включены';
+  $('#btn-theme').innerHTML=svg({light:'sun',dark:'moon',system:'monitor'}[S.theme]);
+  $('#btn-more').innerHTML=svg('more');
+  $('#btn-emoji').innerHTML=svg('smile');
+  $('#btn-send').innerHTML=svg('send',18,2.2);
+}
+function muteLabel(){
+  if(S.mute===-1)return'Без звука, пока не включите';
+  const d=new Date(S.mute*1000);
+  return'Без звука до '+(d.toDateString()===new Date().toDateString()?'':dayLabel(S.mute).toLowerCase()+', ')+hhmm(S.mute);
+}
+function applyTheme(t,persist=true){
+  S.theme=t;document.documentElement.dataset.theme=t;renderIcons();
+  if(persist)api().set_theme(t);
+}
+
+/* ---------- меню ---------- */
+function closeAll(){document.querySelectorAll('.menu,.picker,.grid').forEach(e=>e.remove());
+  document.querySelectorAll('.icon-btn.active').forEach(b=>b.classList.remove('active'))}
+function place(node,anchor,above){
+  document.body.append(node);
+  const r=anchor.getBoundingClientRect(),w=node.offsetWidth,h=node.offsetHeight;
+  let left=Math.min(Math.max(8,r.right-w),innerWidth-w-8);
+  let top=above?r.top-h-6:r.bottom+6;
+  if(!above&&top+h>innerHeight-8)top=r.top-h-6;
+  if(top<8)top=r.bottom+6;
+  node.style.left=left+'px';node.style.top=top+'px';
+}
+function openMenu(btn,items){
+  const wasOpen=btn.classList.contains('active');closeAll();if(wasOpen)return;
+  btn.classList.add('active');
+  const menu=el('div','menu');
+  for(const it of items){
+    if(it.sep){menu.append(el('div','ms'));continue}
+    if(it.label){menu.append(el('div','ml',it.label));continue}
+    const b=el('button','mi'+(it.danger?' danger':''));
+    b.innerHTML=(it.icon?`<span class="ic">${svg(it.icon,16)}</span>`:'<span style="width:16px"></span>');
+    b.append(el('span','lb',it.text));
+    if(it.checked){const c=el('span','ck');c.innerHTML=svg('check',16,2.2);b.append(c)}
+    b.onclick=e=>{e.stopPropagation();closeAll();it.onClick()};
+    menu.append(b);
+  }
+  place(menu,btn,false);
+}
+$('#btn-mute').onclick=e=>{e.stopPropagation();const m=isMuted();openMenu(e.currentTarget,[
+  ...(m?[{label:muteLabel()}]:[]),
+  {text:'Звук и уведомления включены',icon:'bell',checked:!m,onClick:()=>setMute('off')},
+  {sep:1},
+  {text:'Без звука на 1 час',icon:'bellOff',onClick:()=>setMute('1h')},
+  {text:'Без звука на 8 часов',icon:'bellOff',onClick:()=>setMute('8h')},
+  {text:'До завтра, 8:00',icon:'moon',onClick:()=>setMute('tomorrow')},
+  {text:'Пока не включу',icon:'bellOff',checked:S.mute===-1,onClick:()=>setMute('forever')},
+])};
+async function setMute(kind){
+  S.mute=await api().set_mute(kind);renderIcons();
+  toast(kind==='off'?'Звук и уведомления включены':muteLabel());
+}
+$('#btn-theme').onclick=e=>{e.stopPropagation();openMenu(e.currentTarget,[
+  {text:'Светлая',icon:'sun',checked:S.theme==='light',onClick:()=>applyTheme('light')},
+  {text:'Тёмная',icon:'moon',checked:S.theme==='dark',onClick:()=>applyTheme('dark')},
+  {text:'Как в системе',icon:'monitor',checked:S.theme==='system',onClick:()=>applyTheme('system')},
+])};
+$('#btn-more').onclick=e=>{e.stopPropagation();openMenu(e.currentTarget,[
+  {text:'Моё имя: '+S.me.name,icon:'user',onClick:changeName},
+  {text:'Добавить собеседника по IP',icon:'plug',onClick:addPeer},
+  {text:'Запускать при входе в систему',icon:'rocket',checked:S.autostart,onClick:toggleAutostart},
+  {sep:1},{label:'Мой IP-адрес: '+S.ip},{sep:1},
+  {text:'Выйти из LAN Chat',icon:'power',danger:1,onClick:()=>api().quit()},
+])};
+async function changeName(){
+  const v=await dialog('Ваше имя','Так вас увидит собеседник.',S.me.name);
+  if(v){S.me.name=await api().set_name(v);toast('Имя сохранено')}
+}
+async function addPeer(){
+  const v=await dialog('Добавить собеседника','IP-адрес второго компьютера — он указан в его меню «⋯».','','192.168.1.20');
+  if(v){toast(await api().add_peer(v)?'Собеседник добавлен':'Неверный IP-адрес')}
+}
+async function toggleAutostart(){
+  S.autostart=await api().set_autostart(!S.autostart);
+  toast(S.autostart?'Автозапуск включён':'Автозапуск выключен');
+}
+
+/* ---------- реакции и эмодзи ---------- */
+function openPicker(btn,id){
+  closeAll();
+  const m=findMsg(id),p=el('div','picker');
+  for(const e of REACTIONS){
+    const b=el('button',(m.reactions?.[e]||[]).includes(S.me.uid)?'on':'',e);
+    b.onclick=ev=>{ev.stopPropagation();react(id,e)};p.append(b);
+  }
+  place(p,btn,true);
+  if(p.getBoundingClientRect().left<8)p.style.left='8px';
+  if(!m.mine)p.style.left=Math.max(8,btn.getBoundingClientRect().left-6)+'px';
+}
+$('#btn-emoji').onclick=e=>{
+  e.stopPropagation();const btn=e.currentTarget;const wasOpen=!!$('.grid');closeAll();if(wasOpen)return;
+  const g=el('div','grid');
+  for(const em of EMOJI){const b=el('button',null,em);b.onclick=ev=>{ev.stopPropagation();insert(em)};g.append(b)}
+  place(g,btn,true);
+};
+function insert(t){
+  const s=ta.selectionStart,e=ta.selectionEnd;
+  ta.value=ta.value.slice(0,s)+t+ta.value.slice(e);ta.selectionStart=ta.selectionEnd=s+t.length;
+  ta.focus();autosize();
+}
+document.addEventListener('click',e=>{if(!e.target.closest('.menu,.picker,.grid'))closeAll()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeAll()});
+
+/* ---------- отправка ---------- */
+function autosize(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
+  $('#btn-send').disabled=!ta.value.trim()}
+ta.addEventListener('input',autosize);
+ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}});
+$('#btn-send').onclick=send;
+async function send(){
+  const v=ta.value.trim();if(!v)return;
+  ta.value='';autosize();closeAll();
+  const m=await api().send(v);
+  if(m&&!findMsg(m.id)){if(failedIds.has(m.id))m.failed=true;S.messages.push(m);appendMsg(m)}
+}
+
+/* ---------- прочее ---------- */
+function copy(t){
+  const x=el('textarea');x.value=t;x.style.cssText='position:fixed;opacity:0';document.body.append(x);x.select();
+  let ok=false;try{ok=document.execCommand('copy')}catch(e){}
+  x.remove();if(!ok&&navigator.clipboard)navigator.clipboard.writeText(t).catch(()=>{});
+  toast('Скопировано');
+}
+let toastTimer;
+function toast(t){const n=$('#toast');n.textContent=t;n.classList.add('show');
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.classList.remove('show'),1800)}
+function dialog(title,text,value,placeholder){
+  return new Promise(res=>{
+    closeAll();
+    const o=el('div','overlay'),d=el('div','dialog'),inp=el('input');
+    inp.value=value||'';inp.placeholder=placeholder||'';
+    const ok=el('button','btn primary','Сохранить'),no=el('button','btn ghost','Отмена'),row=el('div','row');
+    row.append(no,ok);d.append(el('h3',null,title),el('p',null,text),inp,row);o.append(d);document.body.append(o);
+    const done=v=>{o.remove();res(v);ta.focus()};
+    ok.onclick=()=>done(inp.value.trim()||null);no.onclick=()=>done(null);
+    o.onclick=e=>{if(e.target===o)done(null)};
+    inp.onkeydown=e=>{if(e.key==='Enter')done(inp.value.trim()||null);if(e.key==='Escape')done(null)};
+    setTimeout(()=>{inp.focus();inp.select()},30);
+  });
+}
+setInterval(()=>{
+  document.querySelectorAll('.time').forEach(t=>t.textContent=rel(+t.dataset.ts));
+  if(S.mute>0&&!isMuted()){S.mute=0}
+  renderIcons();
+},30000);
+
+/* ---------- связь с программой ---------- */
+const failedIds=new Set();
+const app={
+  onEvent(e){
+    switch(e.t){
+      case'msg':if(!findMsg(e.msg.id)){S.messages.push(e.msg);appendMsg(e.msg)}break;
+      case'react':{const m=findMsg(e.id);if(m){m.reactions=e.reactions;updateReactions(e.id)}break}
+      case'peers':S.peers=e.peers;renderHeader();if(col.querySelector('.empty'))render();break;
+      case'failed':{
+        const m=findMsg(e.id);if(m)m.failed=true;else failedIds.add(e.id);
+        const box=col.querySelector(`.msg[data-id="${CSS.escape(e.id)}"]`);
+        if(box&&!box.querySelector('.failed'))box.append(failedEl(e.id));
+        toast(S.peers.length?'Сообщение не доставлено':'Собеседник пока не найден');break}
+      case'reload':load();break;
+      case'focus':ta.focus();break;
+    }
+  },
+  applyTheme,closeAll,
+};
+window.app=app;
+let loading=false;
+async function load(){
+  if(loading)return;loading=true;
+  try{
+    const st=await api().get_state();
+    S.me=st.me;S.messages=st.messages;S.peers=st.peers;S.mute=st.mute_until;S.autostart=st.autostart;S.ip=st.ip;
+    for(const id of failedIds){const m=findMsg(id);if(m)m.failed=true}
+    applyTheme(st.theme,false);renderHeader();render();ta.focus();
+  }finally{loading=false}
+}
+renderIcons();
+if(window.pywebview&&window.pywebview.api)load();
+else window.addEventListener('pywebviewready',load);
+</script>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":

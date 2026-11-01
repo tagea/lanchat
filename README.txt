@@ -1,20 +1,14 @@
-LAN Chat — сборка готовых приложений (без установки Python)
-============================================================
+LAN Chat 2.0 — мессенджер для компьютеров в одной Wi-Fi сети
+=============================================================
 
-Сборку делает GitHub бесплатно, на своих Windows- и Mac-компьютерах.
+Готовые программы собирает GitHub автоматически при каждом изменении:
+вкладка Actions -> последний запуск «Build LAN Chat» -> Artifacts.
 
-1. Зайдите на github.com, нажмите «+» -> New repository.
-   Имя: lanchat, тип Private, нажмите Create repository.
-2. На странице репозитория: «uploading an existing file».
-   Перетащите ВСЮ распакованную папку целиком (вместе со скрытой
-   папкой .github — на Mac покажите её клавишами Cmd+Shift+.),
-   нажмите Commit changes.
-3. Откройте вкладку Actions -> «Build LAN Chat». Через 3-5 минут
-   появится зелёная галочка.
-4. Нажмите на запуск -> внизу Artifacts:
-     LANChat-Windows  -> LANChat.exe для Windows
-     LANChat-Mac      -> LANChat.app для Mac
+  LANChat-Windows — распакуйте папку LANChat и запускайте LANChat.exe
+  LANChat-Mac     — перетащите LANChat.app в «Программы»
 
-Если папка .github не загрузилась: в репозитории Add file ->
-Create new file, имя .github/workflows/build.yml, вставьте
-содержимое файла build.yml из этого архива, Commit.
+Первый запуск на Mac: Системные настройки -> Конфиденциальность и
+безопасность -> «Всё равно открыть» (или в Терминале:
+xattr -cr /Applications/LANChat.app).
+
+Запуск из исходника: pip install pywebview, затем python lanchat.py
