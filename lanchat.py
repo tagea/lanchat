@@ -8,19 +8,26 @@ LAN Chat 2.0 — мессенджер для компьютеров в одно�
 Запуск из исходника:  pip install pywebview  и  python lanchat.py
 """
 import json
+import logging
+import math
 import os
 import platform
 import plistlib
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
+import wave
+import webbrowser
 
 import webview
 
 APP_NAME = "LANChat"
+APP_VERSION = "2.1"
 APP_ID = "lanchat"
 TCP_PORT = 50505
 UDP_PORT = 50506
@@ -31,6 +38,8 @@ SELFTEST_DIR = os.environ.get("LANCHAT_SELFTEST")       # режим самоп�
 DATA_DIR = SELFTEST_DIR or os.path.expanduser("~")
 SETTINGS_PATH = os.path.join(DATA_DIR, ".lanchat.json")
 HISTORY_PATH = os.path.join(DATA_DIR, ".lanchat_history.json")
+LOG_PATH = os.path.join(DATA_DIR, ".lanchat_error.log")
+SOUND_DIR = os.path.join(DATA_DIR, ".lanchat_sounds")
 HISTORY_LIMIT = 1000
 
 lock = threading.RLock()
@@ -63,6 +72,8 @@ settings.setdefault("uid", uuid.uuid4().hex)
 settings.setdefault("name", socket.gethostname().split(".")[0])
 settings.setdefault("theme", "system")
 settings.setdefault("mute_until", 0)
+settings.setdefault("sound", "drop")
+settings.setdefault("popup_time", 60)          # секунд; 0 — пока не закроют
 save_json(SETTINGS_PATH, settings)
 
 messages = load_json(HISTORY_PATH, [])
@@ -186,6 +197,8 @@ def set_autostart(enabled):
 class UI:
     main = None
     popup = None
+    popup_count = 0
+    popup_token = 0
     ready = False
     quitting = False
 
@@ -223,17 +236,90 @@ def restore_main():
     push({"t": "focus"})
 
 
-def play_sound():
+# ---------- Звуки ----------
+# Звуки синтезируются самой программой при первом запуске — внешние файлы не нужны.
+
+SOUNDS = [("drop", "Капля"), ("chime", "Колокольчик"), ("pop", "Поп"),
+          ("melody", "Мелодия"), ("system", "Системный")]
+SOUND_IDS = {s for s, _ in SOUNDS}
+SR = 44100
+
+
+def _note(buf, start, freq, dur, amp, decay, harmonics=(1.0,), slide_to=None):
+    n0, n = int(start * SR), int(dur * SR)
+    if len(buf) < n0 + n:
+        buf.extend([0.0] * (n0 + n - len(buf)))
+    phase = 0.0
+    for i in range(n):
+        t = i / SR
+        f = freq if slide_to is None else freq * (slide_to / freq) ** min(1.0, t / 0.12)
+        phase += 2 * math.pi * f / SR
+        env = min(1.0, t / 0.004) * math.exp(-decay * t)
+        buf[n0 + i] += amp * env * sum(h * math.sin(phase * (k + 1)) for k, h in enumerate(harmonics))
+
+
+def synth(kind):
+    b = []
+    if kind == "drop":
+        _note(b, 0, 1500, 0.4, 0.6, 9, (1.0, 0.15), slide_to=620)
+    elif kind == "chime":
+        _note(b, 0, 784, 1.1, 0.4, 4, (1.0, 0.35, 0.12))
+        _note(b, 0.13, 1046.5, 1.1, 0.4, 4, (1.0, 0.35, 0.12))
+    elif kind == "pop":
+        _note(b, 0, 420, 0.16, 0.8, 28, (1.0, 0.2), slide_to=260)
+    elif kind == "melody":
+        for i, f in enumerate((1046.5, 1318.5, 1568.0)):
+            _note(b, i * 0.11, f, 0.6, 0.35, 7, (1.0, 0.25))
+    peak = max(abs(x) for x in b) or 1.0
+    return [x / peak * 0.55 for x in b]
+
+
+def sound_path(kind):
+    path = os.path.join(SOUND_DIR, f"{kind}-v1.wav")
+    if not os.path.exists(path):
+        os.makedirs(SOUND_DIR, exist_ok=True)
+        frames = b"".join(struct.pack("<h", int(max(-1.0, min(1.0, x)) * 32767)) for x in synth(kind))
+        tmp = path + ".tmp"
+        with wave.open(tmp, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes(frames)
+        os.replace(tmp, path)
+    return path
+
+
+def prepare_sounds():
+    for kind, _ in SOUNDS:
+        if kind != "system":
+            try:
+                sound_path(kind)
+            except OSError:
+                pass
+
+
+def play_sound(kind=None):
+    kind = kind or settings.get("sound", "drop")
     try:
+        if kind == "system":
+            if IS_MAC:
+                subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif IS_WIN:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            return
+        path = sound_path(kind)
         if IS_MAC:
-            subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif IS_WIN:
             import winsound
-            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
     except Exception:
         pass
 
+
+# ---------- Всплывающее уведомление ----------
 
 def close_popup(target=None):
     with lock:
@@ -241,10 +327,28 @@ def close_popup(target=None):
         if p is None or (target is not None and p is not target):
             return
         ui.popup = None
+        ui.popup_count = 0
     try:
         p.destroy()
     except Exception:
         pass
+
+
+def _popup_expired(p, token):
+    if ui.popup is p and ui.popup_token == token:
+        close_popup(p)
+
+
+def arm_popup_timer(p):
+    """(Пере)запускает таймер скрытия: каждое новое сообщение продлевает показ."""
+    with lock:
+        ui.popup_token += 1
+        token = ui.popup_token
+    secs = settings.get("popup_time", 60)
+    if secs and secs > 0:
+        t = threading.Timer(secs, _popup_expired, args=(p, token))
+        t.daemon = True
+        t.start()
 
 
 class PopupApi:
@@ -252,10 +356,29 @@ class PopupApi:
         close_popup()
         restore_main()
 
+    def close(self):
+        threading.Thread(target=close_popup, daemon=True).start()
+
 
 def show_popup(name, text):
-    close_popup()
-    w, h = 340, 100
+    with lock:
+        p = ui.popup
+        ui.popup_count += 1
+        count = ui.popup_count
+    data = {"name": name, "text": text, "count": count, "theme": settings.get("theme", "system")}
+
+    if p is not None:                     # окошко уже на экране — обновляем его
+        try:
+            p.evaluate_js("upd(%s)" % json.dumps(data))
+            arm_popup_timer(p)
+            return
+        except Exception:
+            close_popup(p)
+            with lock:
+                ui.popup_count = 1
+            data["count"] = 1
+
+    w, h = 350, 106
     try:
         scr = webview.screens[0]
         sw, sh = scr.width, scr.height
@@ -263,15 +386,14 @@ def show_popup(name, text):
         sw, sh = 1440, 900
     x = sw - w - 16
     y = 38 if IS_MAC else sh - h - 56
-    data = json.dumps({"name": name, "text": text, "theme": settings.get("theme", "system")})
-    html = POPUP_HTML.replace("__DATA__", data.replace("</", "<\\/"))
+    html = POPUP_HTML.replace("__DATA__", json.dumps(data).replace("</", "<\\/"))
     p = webview.create_window(
         "LAN Chat", html=html, width=w, height=h, x=x, y=y,
         frameless=True, easy_drag=False, on_top=True, focus=False, resizable=False,
         js_api=PopupApi(), background_color="#1F1F23" if resolved_dark() else "#FFFFFF")
     with lock:
         ui.popup = p
-    threading.Timer(7, close_popup, args=(p,)).start()
+    arm_popup_timer(p)
 
 
 def notify(name, text):
@@ -468,7 +590,36 @@ class Api:
                     "messages": list(messages), "peers": peers_list(),
                     "theme": settings.get("theme", "system"),
                     "mute_until": settings.get("mute_until", 0),
+                    "sound": settings.get("sound", "drop"),
+                    "sounds": [{"id": k, "name": n} for k, n in SOUNDS],
+                    "popup_time": settings.get("popup_time", 60),
+                    "version": APP_VERSION,
                     "autostart": autostart_enabled(), "ip": MY_IP}
+
+    def set_sound(self, kind):
+        if kind in SOUND_IDS:
+            settings["sound"] = kind
+            save_settings()
+            threading.Thread(target=play_sound, args=(kind,), daemon=True).start()   # прослушать
+        return settings["sound"]
+
+    def set_popup_time(self, secs):
+        try:
+            secs = int(secs)
+        except (TypeError, ValueError):
+            secs = 60
+        if secs in (0, 10, 60, 120):
+            settings["popup_time"] = secs
+            save_settings()
+        return settings["popup_time"]
+
+    def test_notification(self):
+        threading.Thread(target=play_sound, daemon=True).start()
+        show_popup("LAN Chat", "Так будет выглядеть уведомление о новом сообщении 👋")
+        return True
+
+    def on_focus(self):
+        threading.Thread(target=close_popup, daemon=True).start()
 
     def send(self, text):
         text = str(text or "").strip()[:10000]
@@ -636,10 +787,32 @@ def selftest():
         screenshot("4-dark-menu")
         ev("app.closeAll()")
 
+        settings["popup_time"] = 120
         show_popup("Ноутбук", "Привет! Это уведомление поверх всех окон 👋")
         time.sleep(2.5)
         checks["popup"] = ui.popup is not None
+        show_popup("Ноутбук", "И ещё одно — окошко не мигает, а обновляется")
+        time.sleep(1)
+        top = ui.popup.evaluate_js("document.getElementById('top').textContent") if ui.popup else ""
+        checks["popup_counter"] = "2 новых" in (top or "")
         screenshot("5-popup")
+        checks["popup_stays"] = ui.popup is not None              # не исчезает через несколько секунд
+        close_popup()
+
+        ok_sounds = True
+        for kind, _ in SOUNDS:
+            if kind == "system":
+                continue
+            with wave.open(sound_path(kind)) as w:
+                ok_sounds = ok_sounds and w.getnframes() > SR * 0.1
+        play_sound("chime")
+        checks["sounds"] = ok_sounds
+
+        ev("app.applyTheme('light')")
+        ev("notifySettings()")
+        time.sleep(1)
+        checks["notify_settings"] = ev("document.querySelectorAll('.opt').length") == len(SOUNDS)
+        screenshot("6-notify-settings")
         result["ok"] = all(checks.values())
     except Exception as e:
         result["ok"] = False
@@ -651,9 +824,83 @@ def selftest():
     os._exit(code)
 
 
-# ---------- Запуск ----------
+# ---------- Запуск и диагностика ----------
+
+WEBVIEW2_GUID = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+WEBVIEW2_URL = "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+
+
+def webview2_installed():
+    """Без WebView2 интерфейс открылся бы в устаревшем движке Internet Explorer и не работал."""
+    import winreg
+    keys = [(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_GUID}"),
+            (winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_GUID}"),
+            (winreg.HKEY_CURRENT_USER, rf"Software\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_GUID}")]
+    for hive, path in keys:
+        try:
+            with winreg.OpenKey(hive, path) as k:
+                v = winreg.QueryValueEx(k, "pv")[0]
+                if v and v != "0.0.0.0":
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def message_box(text, title="LAN Chat", flags=0x10):
+    if SELFTEST_DIR:
+        print(text, file=sys.stderr)
+        return 0
+    try:
+        if IS_WIN:
+            import ctypes
+            return ctypes.windll.user32.MessageBoxW(None, text, title, flags)
+        if IS_MAC:
+            script = f"display alert {json.dumps(title)} message {json.dumps(text)}"
+            subprocess.run(["osascript", "-e", script], timeout=600)
+    except Exception:
+        pass
+    return 0
+
+
+def log_line(text):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    except OSError:
+        pass
+
+
+def report_crash():
+    tb = traceback.format_exc()
+    log_line(f"LAN Chat {APP_VERSION} ({platform.platform()}) crashed:\n{tb}")
+    message_box("LAN Chat не смог запуститься.\n\n"
+                f"Подробности сохранены в файле:\n{LOG_PATH}\n\n{tb[-700:]}")
+
+
+def setup_logging():
+    h = logging.FileHandler(LOG_PATH, encoding="utf-8", delay=True)
+    h.setLevel(logging.ERROR)
+    h.setFormatter(logging.Formatter("%(asctime)s %(name)s: %(message)s"))
+    logging.getLogger("pywebview").addHandler(h)
+    threading.excepthook = lambda a: log_line(
+        "thread error:\n" + "".join(traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
+
 
 def main():
+    setup_logging()
+    if IS_WIN and not webview2_installed():
+        answer = message_box(
+            "Для работы LAN Chat нужен компонент Microsoft WebView2.\n"
+            "В Windows 11 он уже есть, а в Windows 10 его иногда нет.\n\n"
+            "Нажмите «Да», чтобы скачать его (бесплатно, от Microsoft). "
+            "После установки запустите LAN Chat снова.\n\n"
+            "«Нет» — попробовать запустить без него.",
+            flags=0x04 | 0x30)                      # Да/Нет + значок предупреждения
+        if answer == 6:                             # «Да»
+            webbrowser.open(WEBVIEW2_URL)
+            return
+
     try:
         srv = open_server_socket()
     except OSError:
@@ -674,6 +921,7 @@ def main():
     threading.Thread(target=tcp_server, args=(srv,), daemon=True).start()
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=udp_announcer, daemon=True).start()
+    threading.Thread(target=prepare_sounds, daemon=True).start()
 
     ui.main = webview.create_window(
         "LAN Chat", html=MAIN_HTML, js_api=Api(), width=540, height=740, min_size=(380, 480),
@@ -690,26 +938,40 @@ def main():
 # ---------- Интерфейс ----------
 
 POPUP_HTML = r"""<!doctype html><html data-theme="system"><head><meta charset="utf-8"><style>
-:root{--bg:#fff;--text:#18181b;--muted:#71717a;--line:#e4e4e7;--accent:#2563eb}
-html[data-theme=dark]{--bg:#1f1f23;--text:#f4f4f5;--muted:#a1a1aa;--line:#33333a;--accent:#5b8cff}
-@media (prefers-color-scheme:dark){html[data-theme=system]{--bg:#1f1f23;--text:#f4f4f5;--muted:#a1a1aa;--line:#33333a;--accent:#5b8cff}}
+:root{--bg:#fff;--text:#18181b;--muted:#71717a;--line:#e4e4e7;--accent:#2563eb;--hover:#f1f1f3}
+html[data-theme=dark]{--bg:#1f1f23;--text:#f4f4f5;--muted:#a1a1aa;--line:#33333a;--accent:#5b8cff;--hover:#2c2c32}
+@media (prefers-color-scheme:dark){html[data-theme=system]{--bg:#1f1f23;--text:#f4f4f5;--muted:#a1a1aa;--line:#33333a;--accent:#5b8cff;--hover:#2c2c32}}
 html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);cursor:pointer;
  font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
  -webkit-user-select:none;user-select:none;-webkit-font-smoothing:antialiased}
 .w{box-sizing:border-box;height:100%;border:1px solid var(--line);border-left:3px solid var(--accent);
- padding:11px 14px;display:flex;flex-direction:column;justify-content:center;gap:3px}
-.top{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted)}
-.n{font-weight:600;font-size:14px;color:var(--text)}
-.t{font-size:13.5px;line-height:1.35;color:var(--text);opacity:.85;display:-webkit-box;
+ padding:9px 10px 11px 14px;display:flex;flex-direction:column;gap:2px}
+.top{display:flex;align-items:center;justify-content:space-between;font-size:11.5px;color:var(--muted);margin-bottom:1px}
+.cnt{color:var(--accent);font-weight:600}
+.x{width:22px;height:22px;border:0;border-radius:6px;background:none;color:var(--muted);font-size:17px;line-height:1;
+ cursor:pointer;display:grid;place-items:center;padding:0}
+.x:hover{background:var(--hover);color:var(--text)}
+.n{font-weight:600;font-size:14px;color:var(--text);padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t{font-size:13.5px;line-height:1.35;color:var(--text);opacity:.85;display:-webkit-box;padding-right:8px;
  -webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap}
-</style></head><body><div class="w"><div class="top"><span>LAN Chat</span><span>сейчас</span></div>
+</style></head><body><div class="w">
+<div class="top"><span id="top"></span><button class="x" id="x" title="Закрыть">&times;</button></div>
 <div class="n" id="n"></div><div class="t" id="t"></div></div>
 <script>
-const D=__DATA__;
-document.documentElement.dataset.theme=D.theme;
-document.getElementById('n').textContent=D.name;
-document.getElementById('t').textContent=D.text;
-document.body.addEventListener('click',()=>{if(window.pywebview&&pywebview.api)pywebview.api.open_main()});
+function plural(n,a,b,c){const m=n%10,h=n%100;return m===1&&h!==11?a:(m>=2&&m<=4&&(h<12||h>14)?b:c)}
+function upd(D){
+  document.documentElement.dataset.theme=D.theme;
+  const top=document.getElementById('top');top.textContent='LAN Chat · ';
+  if(D.count>1){const s=document.createElement('span');s.className='cnt';
+    s.textContent=D.count+' '+plural(D.count,'новое сообщение','новых сообщения','новых сообщений');top.append(s)}
+  else top.append('сейчас');
+  document.getElementById('n').textContent=D.name;
+  document.getElementById('t').textContent=D.text;
+}
+upd(__DATA__);
+const api=()=>window.pywebview&&pywebview.api;
+document.getElementById('x').addEventListener('click',e=>{e.stopPropagation();if(api())api().close()});
+document.body.addEventListener('click',()=>{if(api())api().open_main()});
 </script></body></html>"""
 
 MAIN_HTML = r"""<!doctype html>
@@ -809,7 +1071,8 @@ textarea::placeholder{color:var(--muted)}
 
 /* всплывающие элементы */
 .menu{position:fixed;z-index:20;background:var(--menu);border:1px solid var(--line);border-radius:12px;
-  box-shadow:var(--shadow);padding:6px;min-width:250px;max-width:300px;animation:pop .12s ease-out}
+  box-shadow:var(--shadow);padding:6px;min-width:250px;max-width:300px;animation:pop .12s ease-out;
+  max-height:calc(100vh - 70px);overflow-y:auto}
 @keyframes pop{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
 .mi{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:8px 10px;border-radius:8px;font-size:14px}
 .mi:hover{background:var(--hover)}
@@ -846,6 +1109,22 @@ textarea::placeholder{color:var(--muted)}
 .btn{padding:7px 14px;border-radius:9px;font-size:14px}
 .btn.ghost:hover{background:var(--hover)}
 .btn.primary{background:var(--accent);color:#fff}
+.dialog.wide{width:min(400px,92vw)}
+.sec{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:16px 0 6px}
+.opts{display:flex;flex-direction:column;gap:1px}
+.opt{display:flex;align-items:center;gap:11px;padding:8px 10px;border-radius:9px;text-align:left;width:100%;font-size:14px}
+.opt:hover{background:var(--hover)}
+.radio{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--muted);flex:none;display:grid;place-items:center}
+.opt.on .radio{border-color:var(--accent)}
+.opt.on .radio::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.opt .lb{flex:1}
+.opt .play{font-size:12px;color:var(--muted);opacity:0;transition:opacity .12s}
+.opt:hover .play{opacity:1}
+.seg{display:flex;gap:3px;background:var(--input);border:1px solid var(--line);border-radius:10px;padding:3px}
+.seg button{flex:1;padding:6px 4px;border-radius:7px;font-size:13px;color:var(--muted);white-space:nowrap}
+.seg button:hover{color:var(--text)}
+.seg button.on{background:var(--bg);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.15)}
+.row.split{justify-content:space-between}
 </style>
 </head>
 <body>
@@ -886,6 +1165,7 @@ const I={
  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
  moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
  monitor:'<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>',
+ sliders:'<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
  more:'<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
  send:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
  check:'<path d="M20 6 9 17l-5-5"/>',
@@ -898,7 +1178,8 @@ const svg=(n,s=18,w=1.75)=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" 
 const $=s=>document.querySelector(s);
 const el=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e};
 const api=()=>window.pywebview.api;
-const S={me:{uid:'',name:''},messages:[],peers:[],theme:'system',mute:0,autostart:false,ip:''};
+const S={me:{uid:'',name:''},messages:[],peers:[],theme:'system',mute:0,autostart:false,ip:'',
+  sound:'drop',sounds:[],popupTime:60,version:''};
 const feed=$('#feed'),col=$('#col'),ta=$('#ta');
 
 /* ---------- время ---------- */
@@ -1047,6 +1328,8 @@ $('#btn-mute').onclick=e=>{e.stopPropagation();const m=isMuted();openMenu(e.curr
   {text:'Без звука на 8 часов',icon:'bellOff',onClick:()=>setMute('8h')},
   {text:'До завтра, 8:00',icon:'moon',onClick:()=>setMute('tomorrow')},
   {text:'Пока не включу',icon:'bellOff',checked:S.mute===-1,onClick:()=>setMute('forever')},
+  {sep:1},
+  {text:'Звук и время показа…',icon:'sliders',onClick:notifySettings},
 ])};
 async function setMute(kind){
   S.mute=await api().set_mute(kind);renderIcons();
@@ -1060,8 +1343,9 @@ $('#btn-theme').onclick=e=>{e.stopPropagation();openMenu(e.currentTarget,[
 $('#btn-more').onclick=e=>{e.stopPropagation();openMenu(e.currentTarget,[
   {text:'Моё имя: '+S.me.name,icon:'user',onClick:changeName},
   {text:'Добавить собеседника по IP',icon:'plug',onClick:addPeer},
+  {text:'Уведомления и звук…',icon:'sliders',onClick:notifySettings},
   {text:'Запускать при входе в систему',icon:'rocket',checked:S.autostart,onClick:toggleAutostart},
-  {sep:1},{label:'Мой IP-адрес: '+S.ip},{sep:1},
+  {sep:1},{label:'LAN Chat '+S.version+' · IP '+S.ip},{sep:1},
   {text:'Выйти из LAN Chat',icon:'power',danger:1,onClick:()=>api().quit()},
 ])};
 async function changeName(){
@@ -1076,6 +1360,41 @@ async function toggleAutostart(){
   S.autostart=await api().set_autostart(!S.autostart);
   toast(S.autostart?'Автозапуск включён':'Автозапуск выключен');
 }
+
+/* ---------- настройки уведомлений ---------- */
+const TIMES=[[10,'10 сек'],[60,'1 мин'],[120,'2 мин'],[0,'Пока не закрою']];
+function notifySettings(){
+  closeAll();
+  const o=el('div','overlay'),d=el('div','dialog wide');
+  d.append(el('h3',null,'Уведомления'),
+    el('p',null,'Как сообщать о новом сообщении, когда вы работаете в другой программе.'));
+  d.append(el('div','sec','Звук сообщения'));
+  const list=el('div','opts');
+  const drawSounds=()=>{list.textContent='';
+    for(const s of S.sounds){
+      const b=el('button','opt'+(S.sound===s.id?' on':''));
+      b.append(el('span','radio'),el('span','lb',s.name),el('span','play','▶ прослушать'));
+      b.onclick=async()=>{S.sound=await api().set_sound(s.id);drawSounds()};
+      list.append(b);
+    }};
+  drawSounds();d.append(list);
+  d.append(el('div','sec','Показывать уведомление на экране'));
+  const seg=el('div','seg');
+  const drawSeg=()=>{seg.textContent='';
+    for(const [v,l] of TIMES){
+      const b=el('button',S.popupTime===v?'on':'',l);
+      b.onclick=async()=>{S.popupTime=await api().set_popup_time(v);drawSeg()};
+      seg.append(b);
+    }};
+  drawSeg();d.append(seg);
+  const row=el('div','row split'),test=el('button','btn ghost','Проверить уведомление'),ok=el('button','btn primary','Готово');
+  test.onclick=()=>api().test_notification();
+  const done=()=>{o.remove();document.removeEventListener('keydown',esc);ta.focus()};
+  const esc=e=>{if(e.key==='Escape')done()};
+  ok.onclick=done;o.onclick=e=>{if(e.target===o)done()};document.addEventListener('keydown',esc);
+  row.append(test,ok);d.append(row);o.append(d);document.body.append(o);
+}
+window.addEventListener('focus',()=>{if(window.pywebview&&pywebview.api)api().on_focus()});
 
 /* ---------- реакции и эмодзи ---------- */
 function openPicker(btn,id){
@@ -1177,6 +1496,7 @@ async function load(){
   try{
     const st=await api().get_state();
     S.me=st.me;S.messages=st.messages;S.peers=st.peers;S.mute=st.mute_until;S.autostart=st.autostart;S.ip=st.ip;
+    S.sound=st.sound;S.sounds=st.sounds;S.popupTime=st.popup_time;S.version=st.version;
     for(const id of failedIds){const m=findMsg(id);if(m)m.failed=true}
     applyTheme(st.theme,false);renderHeader();render();ta.focus();
   }finally{loading=false}
@@ -1190,4 +1510,10 @@ else window.addEventListener('pywebviewready',load);
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException:
+        report_crash()
+        os._exit(1)

@@ -11,7 +11,7 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -19,28 +19,39 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt pyinstaller
       - run: pyinstaller --noconfirm LANChat.spec
-      - name: Package
+      - name: Download WebView2 bootstrapper
         shell: pwsh
-        run: Compress-Archive -Path dist/LANChat -DestinationPath LANChat-Windows.zip
-      - uses: actions/upload-artifact@v5
-        with:
-          name: LANChat-Windows
-          path: LANChat-Windows.zip
-      - name: Self-test with screenshots
+        run: Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile build/MicrosoftEdgeWebview2Setup.exe
+      - name: Build installer
         shell: pwsh
         run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v5
+        with:
+          name: LANChat-Windows-Setup
+          path: Output/LANChat-Setup.exe
+      - name: Install silently and self-test
+        shell: pwsh
+        run: |
+          Start-Process Output/LANChat-Setup.exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/MERGETASKS="!desktopicon,!autostart"' -Wait
+          $exe = "$env:LOCALAPPDATA\Programs\LANChat\LANChat.exe"
+          if (-not (Test-Path $exe)) { Write-Host "not installed"; exit 1 }
           New-Item -ItemType Directory -Force shots | Out-Null
           $env:LANCHAT_SELFTEST = (Resolve-Path shots).Path
-          $p = Start-Process dist/LANChat/LANChat.exe -PassThru -Wait
+          $p = Start-Process $exe -PassThru -Wait
           Write-Host "exit code: $($p.ExitCode)"
           if (Test-Path shots/selftest.json) { Get-Content shots/selftest.json }
+          if (Test-Path shots/.lanchat_error.log) { Get-Content shots/.lanchat_error.log }
           if ($p.ExitCode -ne 0) { exit 1 }
       - name: Publish screenshots
         if: always()
         shell: bash
         run: |
           [ -d shots ] || exit 0
-          cd shots
+          cd shots && rm -rf .lanchat_sounds
           git init -q -b shots-windows
           git -c user.name=ci -c user.email=ci@example.com add -A
           git -c user.name=ci -c user.email=ci@example.com commit -qm "Windows screenshots ${{ github.sha }}"
@@ -48,7 +59,7 @@ jobs:
 
   macos:
     runs-on: macos-latest   # Apple Silicon (M1/M2/M3/M4)
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -69,13 +80,31 @@ jobs:
           code=$?
           echo "exit code: $code"
           cat shots/selftest.json 2>/dev/null
+          cat shots/.lanchat_error.log 2>/dev/null
           exit $code
       - name: Publish screenshots
         if: always()
         run: |
           [ -d shots ] || exit 0
-          cd shots
+          cd shots && rm -rf .lanchat_sounds
           git init -q -b shots-mac
           git -c user.name=ci -c user.email=ci@example.com add -A
           git -c user.name=ci -c user.email=ci@example.com commit -qm "Mac screenshots ${{ github.sha }}"
           git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" shots-mac
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: out
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v2.1.${{ github.run_number }}"
+          gh release create "$tag" -R "${{ github.repository }}" --latest \
+            --title "LAN Chat $tag" \
+            --notes "Windows: скачайте LANChat-Setup.exe и запустите. Mac: скачайте LANChat-mac.zip, распакуйте и перетащите LANChat.app в «Программы»." \
+            out/LANChat-Windows-Setup/LANChat-Setup.exe out/LANChat-Mac/LANChat-mac.zip
