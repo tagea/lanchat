@@ -54,6 +54,8 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Устанавливаю Microsoft WebView2…"; Check: NeedsWebView2; Flags: waituntilterminated
 Filename: "{app}\LANChat.exe"; Description: "Запустить LAN Chat"; Flags: nowait postinstall skipifsilent
+; после обновления из самой программы (тихая установка) — запустить новую версию
+Filename: "{app}\LANChat.exe"; Flags: nowait; Check: ShouldRelaunch
 
 [Code]
 const
@@ -71,6 +73,11 @@ begin
   Result := not (HasVersion(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\' + WV2) or
                  HasVersion(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\' + WV2) or
                  HasVersion(HKCU, 'Software\Microsoft\EdgeUpdate\Clients\' + WV2));
+end;
+
+function ShouldRelaunch(): Boolean;
+begin
+  Result := WizardSilent() and (ExpandConstant('{param:RELAUNCH|0}') = '1');
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

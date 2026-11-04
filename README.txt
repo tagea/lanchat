@@ -14,4 +14,5 @@ LAN Chat — мессенджер для компьютеров в одной Wi
 .lanchat_error.log в папке пользователя.
 
 Сборка: GitHub Actions собирает обе версии при каждом изменении.
-Запуск из исходника: pip install pywebview, затем python lanchat.py
+Обновление: меню ⋯ -> «Проверить обновления» (программа также проверяет сама раз в 6 часов).
+Запуск из исходника: pip install pywebview certifi, затем python lanchat.py

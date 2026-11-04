@@ -13,13 +13,19 @@ import math
 import os
 import platform
 import plistlib
+import re
+import shlex
 import socket
+import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 import wave
 import webbrowser
@@ -27,7 +33,7 @@ import webbrowser
 import webview
 
 APP_NAME = "LANChat"
-APP_VERSION = "2.2"
+APP_VERSION = "2.3.0"            # при сборке подставляется номер сборки
 APP_ID = "lanchat"
 TCP_PORT = 50505
 UDP_PORT = 50506
@@ -187,7 +193,8 @@ def set_autostart(enabled):
             os.makedirs(os.path.dirname(MAC_PLIST), exist_ok=True)
             with open(MAC_PLIST, "wb") as f:
                 plistlib.dump({"Label": "com.lanchat.app", "ProgramArguments": cmd,
-                               "RunAtLoad": True, "LimitLoadToSessionType": "Aqua"}, f)
+                               "RunAtLoad": True, "LimitLoadToSessionType": "Aqua",
+                               "AbandonProcessGroup": True}, f)
         elif os.path.exists(MAC_PLIST):
             os.remove(MAC_PLIST)
 
@@ -201,6 +208,7 @@ class UI:
     popup_token = 0
     ready = False
     quitting = False
+    just_updated = False
 
 
 ui = UI()
@@ -675,7 +683,8 @@ class Api:
                     "sound": settings.get("sound", "drop"),
                     "sounds": [{"id": k, "name": n} for k, n in SOUNDS],
                     "popup_time": settings.get("popup_time", 60),
-                    "version": APP_VERSION,
+                    "version": APP_VERSION, "just_updated": ui.just_updated,
+                    "update": upd.latest if upd.latest and upd.latest.get("available") else None,
                     "autostart": autostart_enabled(), "ip": MY_IP}
 
     def set_sound(self, kind):
@@ -780,6 +789,19 @@ class Api:
             save_settings()
         return settings["name"]
 
+    def check_update(self):
+        try:
+            info = check_update()
+            return {"available": info["available"], "version": info["version"], "current": APP_VERSION}
+        except Exception as e:
+            return {"error": str(e)[:200], "current": APP_VERSION}
+
+    def update_now(self):
+        threading.Thread(target=run_update, daemon=True).start()
+
+    def open_releases(self):
+        webbrowser.open(RELEASES_PAGE)
+
     def add_peer(self, ip):
         ip = str(ip or "").strip()
         try:
@@ -818,7 +840,7 @@ def selftest():
     checks = result["checks"]
 
     def watchdog():
-        time.sleep(150)
+        time.sleep(300)
         result["error"] = "timeout"
         save_json(os.path.join(SELFTEST_DIR, "selftest.json"), result)
         os._exit(3)
@@ -919,6 +941,29 @@ def selftest():
         time.sleep(1)
         checks["notify_settings"] = ev("document.querySelectorAll('.opt').length") == len(SOUNDS)
         screenshot("6-notify-settings")
+        ev("document.querySelector('.overlay').remove()")
+
+        info = check_update()                              # настоящий запрос к GitHub
+        checks["update_check"] = bool(info.get("url")) and bool(info.get("version"))
+        checks["update_detects_newer"] = check_update(current="0.0.1")["available"]
+        upd.latest = None
+        dest = os.path.join(SELFTEST_DIR, "dl-" + asset_name())
+        download(info["url"], dest, lambda p: None)
+        ok_dl = os.path.getsize(dest) > 5_000_000
+        if IS_MAC:
+            out = os.path.join(SELFTEST_DIR, "dl-unpacked")
+            subprocess.run(["ditto", "-x", "-k", dest, out], check=True, timeout=180)
+            ok_dl = ok_dl and os.path.isfile(os.path.join(out, "LANChat.app", "Contents", "MacOS", "LANChat"))
+            subprocess.run(["rm", "-rf", out])
+        os.remove(dest)
+        checks["update_download"] = ok_dl
+        push({"t": "update", "state": "available", "version": "9.9.9"})
+        time.sleep(0.8)
+        checks["update_banner"] = bool(ev("document.getElementById('update').classList.contains('show')"))
+        screenshot("7-update")
+        push({"t": "update", "state": "downloading", "pct": 42, "version": "9.9.9"})
+        time.sleep(0.6)
+        checks["update_progress"] = "42" in (ev("document.getElementById('update').textContent") or "")
         result["ok"] = all(checks.values())
     except Exception as e:
         result["ok"] = False
@@ -928,6 +973,172 @@ def selftest():
     quit_app()
     time.sleep(3)
     os._exit(code)
+
+
+# ---------- Обновление ----------
+
+REPO = "tagea/lanchat"
+UPDATE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
+RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
+CHECK_EVERY = 6 * 3600
+
+
+class Upd:
+    latest = None
+    busy = False
+
+
+upd = Upd()
+
+
+def ssl_context():
+    try:
+        import certifi                       # свои сертификаты: на Mac системные Python не видит
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def http_open(url, timeout=20, api=False):
+    headers = {"User-Agent": f"LANChat/{APP_VERSION}"}
+    if api:
+        headers["Accept"] = "application/vnd.github+json"
+        token = os.environ.get("LANCHAT_GH_TOKEN") if SELFTEST_DIR else None
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
+    except urllib.error.URLError as e:
+        # антивирус или корпоративная сеть подменяют сертификат — доверяем системному хранилищу
+        if not isinstance(getattr(e, "reason", None), ssl.SSLError):
+            raise
+        return urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context())
+
+
+def vtuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:4])
+
+
+def asset_name():
+    return "LANChat-Setup.exe" if IS_WIN else "LANChat-mac.zip"
+
+
+def check_update(current=None):
+    current = current or APP_VERSION
+    with http_open(UPDATE_API, api=True) as r:
+        data = json.load(r)
+    version = str(data.get("tag_name", "")).lstrip("v")
+    url = next((a.get("browser_download_url") for a in data.get("assets", [])
+                if a.get("name") == asset_name()), None)
+    info = {"version": version, "current": current, "url": url,
+            "available": bool(url) and vtuple(version) > vtuple(current)}
+    upd.latest = info
+    return info
+
+
+def auto_check_loop():
+    time.sleep(10)
+    while True:
+        try:
+            info = check_update()
+            if info["available"]:
+                push({"t": "update", "state": "available", "version": info["version"]})
+        except Exception:
+            pass                             # нет интернета — проверим позже
+        time.sleep(CHECK_EVERY)
+
+
+def download(url, dest, progress):
+    with http_open(url, timeout=60) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done, last = 0, -1
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            pct = int(done * 100 / total) if total else 0
+            if pct != last:
+                last = pct
+                progress(pct)
+    if total and done != total:
+        raise RuntimeError("файл скачался не полностью")
+
+
+def mac_app_path():
+    app = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+    return app if app.endswith(".app") else None
+
+
+def install_windows(setup):
+    flags = 0x00000008 | 0x00000200          # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/RELAUNCH=1"],
+                     creationflags=flags, close_fds=True)
+
+
+def install_mac(zip_path, workdir):
+    app = mac_app_path()
+    if not app:
+        raise RuntimeError("не найдено приложение LANChat.app")
+    parent = os.path.dirname(app)
+    if not (os.access(parent, os.W_OK) and os.access(app, os.W_OK)):
+        raise RuntimeError(f"нет прав на запись в папку {parent}")
+    out = os.path.join(workdir, "new")
+    subprocess.run(["ditto", "-x", "-k", zip_path, out], check=True, timeout=180)
+    new = os.path.join(out, "LANChat.app")
+    if not os.path.isdir(new):
+        raise RuntimeError("в архиве нет LANChat.app")
+    script = os.path.join(workdir, "update.sh")
+    with open(script, "w") as f:
+        f.write(f"""#!/bin/sh
+pid={os.getpid()}; app={shlex.quote(app)}; new={shlex.quote(new)}
+i=0
+while kill -0 "$pid" 2>/dev/null && [ $i -lt 150 ]; do sleep 0.2; i=$((i+1)); done
+rm -rf "$app.old"
+if mv "$app" "$app.old"; then
+  if mv "$new" "$app"; then rm -rf "$app.old"; else mv "$app.old" "$app"; fi
+fi
+xattr -cr "$app" 2>/dev/null
+open "$app"
+""")
+    subprocess.Popen(["/bin/sh", script], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def run_update():
+    if upd.busy:
+        return
+    upd.busy = True
+    version = ""
+    try:
+        info = upd.latest if upd.latest and upd.latest.get("available") else check_update()
+        version = info["version"]
+        if not info["available"]:
+            push({"t": "update", "state": "none", "version": APP_VERSION})
+            return
+        if not getattr(sys, "frozen", False) or not (IS_WIN or IS_MAC):
+            webbrowser.open(RELEASES_PAGE)        # запуск из исходника — просто открываем страницу
+            push({"t": "update", "state": "available", "version": version})
+            return
+        workdir = tempfile.mkdtemp(prefix="lanchat-update-")
+        dest = os.path.join(workdir, asset_name())
+        push({"t": "update", "state": "downloading", "pct": 0, "version": version})
+        download(info["url"], dest,
+                 lambda p: push({"t": "update", "state": "downloading", "pct": p, "version": version}))
+        push({"t": "update", "state": "installing", "version": version})
+        if IS_WIN:
+            install_windows(dest)
+        else:
+            install_mac(dest, workdir)
+        time.sleep(0.8)
+        quit_app()                                # новая версия запустится сама
+    except Exception as e:
+        log_line("update failed:\n" + traceback.format_exc())
+        push({"t": "update", "state": "error", "msg": str(e)[:200], "version": version})
+    finally:
+        upd.busy = False
 
 
 # ---------- Запуск и диагностика ----------
@@ -1028,6 +1239,12 @@ def main():
     threading.Thread(target=udp_listener, daemon=True).start()
     threading.Thread(target=udp_announcer, daemon=True).start()
     threading.Thread(target=prepare_sounds, daemon=True).start()
+    if not SELFTEST_DIR:
+        threading.Thread(target=auto_check_loop, daemon=True).start()
+        prev = settings.get("last_version")
+        ui.just_updated = bool(prev) and prev != APP_VERSION
+        settings["last_version"] = APP_VERSION
+        save_settings()
 
     ui.main = webview.create_window(
         "LAN Chat", html=MAIN_HTML, js_api=Api(), width=540, height=740, min_size=(380, 480),
@@ -1211,6 +1428,18 @@ textarea::placeholder{color:var(--muted)}
   background:var(--menu);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);animation:pop .12s ease-out}
 .grid button{width:34px;height:34px;border-radius:8px;font-size:19px}
 .grid button:hover{background:var(--hover)}
+.update{display:none;align-items:center;gap:10px;padding:8px 14px 8px 16px;background:var(--chip-on);
+  border-bottom:1px solid var(--line);font-size:13.5px;position:relative;overflow:hidden}
+.update.show{display:flex}
+.update .ic{color:var(--accent);flex:none}
+.update .lb{flex:1;min-width:0}
+.update .lb b{font-weight:600}
+.update .btn{padding:5px 12px;font-size:13px;white-space:nowrap}
+.update .bar{position:absolute;left:0;bottom:0;height:2px;background:var(--accent);transition:width .2s}
+.update.err{background:color-mix(in srgb,var(--danger) 12%,var(--bg))}
+.update.err .ic{color:var(--danger)}
+.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .toast{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);background:var(--text);color:var(--bg);
   font-size:13px;padding:8px 14px;border-radius:10px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:40}
 .toast.show{opacity:1}
@@ -1257,6 +1486,7 @@ textarea::placeholder{color:var(--muted)}
   <button class="icon-btn" id="btn-more" title="Настройки"></button>
 </header>
 
+<div class="update" id="update"></div>
 <main id="feed"><div class="col" id="col"></div></main>
 
 <footer>
@@ -1287,6 +1517,9 @@ const I={
  tick:'<path d="M4 12.5l4.5 4.5L19 6.5"/>',
  ticks:'<path d="M1.5 12.5L6 17 16.5 6.5"/><path d="M11 16l1 1L22.5 6.5"/>',
  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+ download:'<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/>',
+ refresh:'<path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/>',
+ alert:'<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
  more:'<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
  send:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
  check:'<path d="M20 6 9 17l-5-5"/>',
@@ -1508,6 +1741,7 @@ $('#btn-more').onclick=e=>{e.stopPropagation();openMenu(e.currentTarget,[
   {text:'Добавить собеседника по IP',icon:'plug',onClick:addPeer},
   {text:'Уведомления и звук…',icon:'sliders',onClick:notifySettings},
   {text:'Запускать при входе в систему',icon:'rocket',checked:S.autostart,onClick:toggleAutostart},
+  {text:'Проверить обновления',icon:'refresh',onClick:checkUpdates},
   {sep:1},{label:'LAN Chat '+S.version+' · IP '+S.ip},{sep:1},
   {text:'Выйти из LAN Chat',icon:'power',danger:1,onClick:()=>api().quit()},
 ])};
@@ -1622,8 +1856,45 @@ function copy(t){
   toast('Скопировано');
 }
 let toastTimer;
-function toast(t){const n=$('#toast');n.textContent=t;n.classList.add('show');
-  clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.classList.remove('show'),1800)}
+function toast(t,ms){const n=$('#toast');n.textContent=t;n.classList.add('show');
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.classList.remove('show'),ms||1800)}
+
+/* ---------- обновление ---------- */
+function renderUpdate(u){
+  const box=$('#update');box.textContent='';box.className='update';
+  if(!u||u.state==='none')return;
+  box.classList.add('show');
+  const ic=el('span','ic'),lb=el('span','lb');
+  if(u.state==='available'){
+    ic.innerHTML=svg('download',17);
+    lb.append('Доступна новая версия ',el('b',null,u.version));
+    const go=el('button','btn primary','Обновить');go.onclick=()=>{renderUpdate({state:'downloading',pct:0,version:u.version});api().update_now()};
+    const later=el('button','btn ghost','Позже');later.onclick=()=>renderUpdate(null);
+    box.append(ic,lb,later,go);
+  }else if(u.state==='downloading'){
+    ic.innerHTML=svg('refresh',17);ic.firstChild.classList.add('spin');
+    lb.textContent='Скачиваю версию '+u.version+'… '+(u.pct||0)+'%';
+    const bar=el('div','bar');bar.style.width=(u.pct||0)+'%';
+    box.append(ic,lb,bar);
+  }else if(u.state==='installing'){
+    ic.innerHTML=svg('refresh',17);ic.firstChild.classList.add('spin');
+    lb.textContent='Устанавливаю… LAN Chat перезапустится через несколько секунд';
+    box.append(ic,lb);
+  }else if(u.state==='error'){
+    box.classList.add('err');ic.innerHTML=svg('alert',17);
+    lb.textContent='Не удалось обновить: '+(u.msg||'ошибка');lb.title=u.msg||'';
+    const man=el('button','btn ghost','Скачать вручную');man.onclick=()=>api().open_releases();
+    const again=el('button','btn primary','Повторить');again.onclick=()=>{renderUpdate({state:'downloading',pct:0,version:u.version});api().update_now()};
+    box.append(ic,lb,man,again);
+  }
+}
+async function checkUpdates(){
+  toast('Проверяю обновления…');
+  const r=await api().check_update();
+  if(r.error){toast('Не удалось проверить: нет связи с интернетом',3000);return}
+  if(r.available)renderUpdate({state:'available',version:r.version});
+  else toast('У вас последняя версия ('+r.current+')',2500);
+}
 function dialog(title,text,value,placeholder){
   return new Promise(res=>{
     closeAll();
@@ -1662,6 +1933,7 @@ const app={
         toast(S.peers.length?'Сообщение не доставлено':'Собеседник пока не найден');break}
       case'reload':load();break;
       case'focus':ta.focus();break;
+      case'update':if(e.state==='none')toast('У вас последняя версия',2500);else renderUpdate(e);break;
     }
   },
   applyTheme,closeAll,
@@ -1676,6 +1948,8 @@ async function load(){
     S.sound=st.sound;S.sounds=st.sounds;S.popupTime=st.popup_time;S.version=st.version;
     for(const id of failedIds){const m=findMsg(id);if(m)m.failed=true}
     applyTheme(st.theme,false);renderHeader();render();ta.focus();markRead();
+    if(st.update)renderUpdate({state:'available',version:st.update.version});
+    if(st.just_updated)toast('LAN Chat обновлён до версии '+st.version,4000);
   }finally{loading=false}
 }
 renderIcons();
