@@ -36,7 +36,7 @@ from collections import OrderedDict
 import webview
 
 APP_NAME = "LANChat"
-APP_VERSION = "2.3.0"            # при сборке подставляется номер сборки
+APP_VERSION = "2.4.0"            # при сборке подставляется номер сборки
 APP_ID = "lanchat"
 TCP_PORT = 50505
 UDP_PORT = 50506
