@@ -7,6 +7,7 @@ LAN Chat 2.0 — мессенджер для компьютеров в одно�
 
 Запуск из исходника:  pip install pywebview  и  python lanchat.py
 """
+import base64
 import json
 import logging
 import math
@@ -29,6 +30,8 @@ import urllib.request
 import uuid
 import wave
 import webbrowser
+import zlib
+from collections import OrderedDict
 
 import webview
 
@@ -86,6 +89,20 @@ messages = load_json(HISTORY_PATH, [])
 if not isinstance(messages, list):
     messages = []
 peers = {}            # ip -> имя
+peer_uids = {}        # uid собеседника -> его текущий ip
+
+# ---------- Картинки ----------
+# Картинки не копируются никуда: у отправителя сообщение хранит путь к файлу на его компьютере,
+# а получатель при показе запрашивает файл у отправителя напрямую по Wi-Fi и держит его только в памяти.
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+MAX_IMAGE = 25 * 1024 * 1024
+PASTE_DIR = os.path.join(SELFTEST_DIR, "pasted") if SELFTEST_DIR else \
+    os.path.join(os.path.expanduser("~"), "Pictures", "LAN Chat")
+shared_files = {}     # id файла -> путь (мои отправленные картинки)
+pending_attach = {}   # токен -> картинка, выбранная, но ещё не отправленная
+image_cache = OrderedDict()   # id сообщения -> (mime, байты), только в памяти
+IMAGE_CACHE_LIMIT = 150 * 1024 * 1024
 
 
 def save_settings():
@@ -442,6 +459,11 @@ def peers_list():
         return [{"ip": ip, "name": n} for ip, n in peers.items()]
 
 
+def remember_uid(uid, ip):
+    if uid and ip:
+        peer_uids[str(uid)[:64]] = ip
+
+
 def add_peer(ip, name):
     with lock:
         if peers.get(ip) == name:
@@ -479,6 +501,7 @@ def udp_listener():
             data, (ip, _) = s.recvfrom(2048)
             info = json.loads(data.decode())
             if info.get("app") == APP_ID and info.get("uid") != settings["uid"]:
+                remember_uid(info.get("uid"), ip)
                 add_peer(ip, str(info.get("name", ip))[:40])
         except (OSError, ValueError, AttributeError):
             continue
@@ -503,6 +526,30 @@ def apply_reaction(msg_id, emoji, uid, on):
 
 
 def handle_client(conn, ip):
+    try:
+        _handle_client(conn, ip)
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def clean_reply(r):
+    if not isinstance(r, dict) or not r.get("id"):
+        return None
+    return {"id": str(r["id"])[:64], "name": str(r.get("name", ""))[:40], "text": str(r.get("text", ""))[:300]}
+
+
+def clean_image(i):
+    if not isinstance(i, dict) or not i.get("id"):
+        return None
+    mime = str(i.get("mime", ""))
+    return {"id": str(i["id"])[:64], "name": os.path.basename(str(i.get("name", "image")))[:120],
+            "size": int(i.get("size") or 0), "mime": mime if mime in IMAGE_TYPES.values() else "image/png"}
+
+
+def _handle_client(conn, ip):
     chunks = []
     try:
         conn.settimeout(5)
@@ -514,8 +561,6 @@ def handle_client(conn, ip):
         data = json.loads(b"".join(chunks).decode())
     except (OSError, ValueError):
         return
-    finally:
-        conn.close()
     if not isinstance(data, dict):
         return
     kind = data.get("type")
@@ -525,12 +570,22 @@ def handle_client(conn, ip):
             restore_main()
         return
 
+    if kind == "get_file":
+        serve_file(conn, str(data.get("id", ""))[:64])
+        return
+
     if kind == "msg":
         m = {"id": str(data.get("id", uuid.uuid4().hex))[:64],
              "uid": str(data.get("uid", ""))[:64],
              "name": str(data.get("name", ip))[:40],
              "text": str(data.get("text", ""))[:10000],
-             "ts": time.time(), "mine": False, "reactions": {}, "unread": True}
+             "ts": time.time(), "mine": False, "reactions": {}, "unread": True, "ip": ip}
+        reply, image = clean_reply(data.get("reply")), clean_image(data.get("image"))
+        if reply:
+            m["reply"] = reply
+        if image:
+            m["image"] = image
+        remember_uid(m["uid"], ip)
         with lock:
             if find_msg(m["id"]):
                 return
@@ -539,7 +594,8 @@ def handle_client(conn, ip):
         add_peer(ip, m["name"])
         push({"t": "msg", "msg": m})
         update_title()
-        notify(m["name"], m["text"])
+        preview = ("📷 Картинка" + (" · " + m["text"] if m["text"] else "")) if image else m["text"]
+        notify(m["name"], preview)
 
     elif kind == "read":
         ids = data.get("ids")
@@ -547,6 +603,7 @@ def handle_client(conn, ip):
             set_status({str(i)[:64] for i in ids[:5000]}, "read")
 
     elif kind == "typing":
+        remember_uid(data.get("uid"), ip)
         add_peer(ip, str(data.get("name", ip))[:40])
         push({"t": "typing", "uid": str(data.get("uid", ""))[:64],
               "name": str(data.get("name", ip))[:40], "on": bool(data.get("on"))})
@@ -592,8 +649,12 @@ def send_payload(payload, timeout=3):
 
 
 def deliver(m):
-    ok = send_payload({"type": "msg", "id": m["id"], "uid": settings["uid"],
-                       "name": settings["name"], "text": m["text"]})
+    payload = {"type": "msg", "id": m["id"], "uid": settings["uid"], "name": settings["name"], "text": m["text"]}
+    if m.get("reply"):
+        payload["reply"] = m["reply"]
+    if m.get("image"):
+        payload["image"] = {k: v for k, v in m["image"].items() if k != "path"}   # путь не передаём
+    ok = send_payload(payload)
     with lock:
         if ok:
             m.pop("failed", None)
@@ -604,6 +665,141 @@ def deliver(m):
         set_status({m["id"]}, "delivered")
     else:
         push({"t": "failed", "id": m["id"]})
+
+
+# ---------- Передача картинок ----------
+
+def file_path_for(fid):
+    p = shared_files.get(fid)
+    if p:
+        return p
+    with lock:
+        for m in reversed(messages):
+            img = m.get("image") or {}
+            if m.get("mine") and img.get("id") == fid and img.get("path"):
+                shared_files[fid] = img["path"]
+                return img["path"]
+    return None
+
+
+def serve_file(conn, fid):
+    """Отдаёт собеседнику мою картинку прямо с диска."""
+    path = file_path_for(fid)
+    data, hdr = b"", {"ok": False, "reason": "missing"}
+    try:
+        if path and os.path.isfile(path) and os.path.getsize(path) <= MAX_IMAGE:
+            with open(path, "rb") as f:
+                data = f.read()
+            hdr = {"ok": True, "size": len(data),
+                   "mime": IMAGE_TYPES.get(os.path.splitext(path)[1].lower(), "image/png")}
+    except OSError:
+        data, hdr = b"", {"ok": False, "reason": "missing"}
+    head = json.dumps(hdr).encode()
+    try:
+        conn.settimeout(60)
+        conn.sendall(struct.pack(">I", len(head)) + head + data)
+    except OSError:
+        pass
+
+
+def fetch_file(ip, fid):
+    with socket.create_connection((ip, TCP_PORT), timeout=4) as s:
+        s.sendall(json.dumps({"type": "get_file", "id": fid}).encode())
+        s.shutdown(socket.SHUT_WR)
+        s.settimeout(30)
+        buf = bytearray()
+        while True:
+            b = s.recv(262144)
+            if not b:
+                break
+            buf += b
+            if len(buf) > MAX_IMAGE + 65536:
+                raise ValueError("слишком большой файл")
+    n = struct.unpack(">I", bytes(buf[:4]))[0]
+    hdr = json.loads(bytes(buf[4:4 + n]).decode())
+    data = bytes(buf[4 + n:])
+    if not hdr.get("ok"):
+        raise FileNotFoundError(hdr.get("reason", "missing"))
+    if len(data) != hdr.get("size"):
+        raise ValueError("картинка пришла не полностью")
+    return hdr.get("mime", "image/png"), data
+
+
+def cache_put(key, mime, data):
+    image_cache[key] = (mime, data)
+    image_cache.move_to_end(key)
+    while sum(len(v[1]) for v in image_cache.values()) > IMAGE_CACHE_LIMIT and len(image_cache) > 1:
+        image_cache.popitem(last=False)
+
+
+def image_bytes(msg_id):
+    """(mime, байты) картинки из сообщения. Ошибки: FileNotFoundError, ConnectionError."""
+    with lock:
+        m = find_msg(msg_id)
+    img = (m or {}).get("image")
+    if not img:
+        raise FileNotFoundError("missing")
+    if m.get("mine"):
+        path = img.get("path")
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError("moved")
+        with open(path, "rb") as f:
+            return img.get("mime", "image/png"), f.read()
+    if msg_id in image_cache:
+        image_cache.move_to_end(msg_id)
+        return image_cache[msg_id]
+    ips = [ip for ip in (peer_uids.get(m.get("uid")), m.get("ip")) if ip]
+    last_err = ConnectionError("offline")
+    for ip in dict.fromkeys(ips):
+        try:
+            mime, data = fetch_file(ip, img["id"])
+            cache_put(msg_id, mime, data)
+            return mime, data
+        except FileNotFoundError:
+            raise
+        except (OSError, ValueError) as e:
+            last_err = ConnectionError(str(e) or "offline")
+    raise last_err
+
+
+def to_data_url(mime, data):
+    return f"data:{mime};base64," + base64.b64encode(data).decode()
+
+
+def add_attachment(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in IMAGE_TYPES:
+        return {"error": f"«{os.path.basename(path)}» — это не картинка"}
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {"error": f"Не удалось открыть «{os.path.basename(path)}»"}
+    if size > MAX_IMAGE:
+        return {"error": f"«{os.path.basename(path)}» больше 25 МБ"}
+    token = uuid.uuid4().hex
+    pending_attach[token] = {"path": path, "name": os.path.basename(path), "size": size, "mime": IMAGE_TYPES[ext]}
+    with open(path, "rb") as f:
+        thumb = to_data_url(IMAGE_TYPES[ext], f.read())
+    return {"token": token, "name": os.path.basename(path), "thumb": thumb}
+
+
+def make_png(path, w, h, top, bottom):
+    """Простая картинка-градиент (для самопроверки, без сторонних библиотек)."""
+    rows = bytearray()
+    for y in range(h):
+        t = y / (h - 1)
+        rows.append(0)
+        for x in range(w):
+            s = x / (w - 1)
+            rows += bytes(int((top[i] * (1 - t) + bottom[i] * t) * (0.75 + 0.25 * s)) for i in range(3))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
+        chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
 
 
 # ---------- Доставлено / прочитано ----------
@@ -720,17 +916,96 @@ class Api:
             {"type": "typing", "uid": settings["uid"], "name": settings["name"], "on": bool(on)},),
             kwargs={"timeout": 1}).start()
 
-    def send(self, text):
+    def send(self, text, reply=None, attachments=None):
+        """Возвращает список созданных сообщений: картинки по одной, подпись — у последней."""
         text = str(text or "").strip()[:10000]
-        if not text:
-            return None
-        m = {"id": uuid.uuid4().hex, "uid": settings["uid"], "name": settings["name"],
-             "text": text, "ts": time.time(), "mine": True, "reactions": {}, "status": "sending"}
+        files = [pending_attach.pop(t) for t in (attachments or []) if t in pending_attach]
+        if not text and not files:
+            return []
+        reply = clean_reply(reply)
+        created, now = [], time.time()
+        for i, f in enumerate(files):
+            fid = uuid.uuid4().hex
+            shared_files[fid] = f["path"]
+            created.append({"text": text if i == len(files) - 1 else "",
+                            "image": {"id": fid, "name": f["name"], "size": f["size"],
+                                      "mime": f["mime"], "path": f["path"]}})
+        if not files:
+            created.append({"text": text})
+        out = []
+        for i, part in enumerate(created):
+            m = {"id": uuid.uuid4().hex, "uid": settings["uid"], "name": settings["name"],
+                 "ts": now + i * 0.001, "mine": True, "reactions": {}, "status": "sending", **part}
+            if reply and i == 0:
+                m["reply"] = reply
+            out.append(m)
         with lock:
-            messages.append(m)
+            messages.extend(out)
         save_history()
-        threading.Thread(target=deliver, args=(m,), daemon=True).start()
-        return m
+        for m in out:
+            threading.Thread(target=deliver, args=(m,), daemon=True).start()
+        return out
+
+    def pick_images(self):
+        types = ("Картинки (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp)",)
+        try:
+            paths = ui.main.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=True, file_types=types)
+        except Exception:
+            paths = ui.main.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=True)
+        return [add_attachment(p) for p in (paths or [])][:10]
+
+    def add_image_data(self, name, data_url):
+        """Вставленная или перетащенная картинка: сохраняем на ЭТОМ компьютере и отправляем ссылку."""
+        try:
+            head, b64 = str(data_url).split(",", 1)
+            mime = head[5:].split(";")[0]
+            ext = next((e for e, mt in IMAGE_TYPES.items() if mt == mime and e != ".jpeg"), None)
+            if not ext:
+                return {"error": "Этот формат картинки не поддерживается"}
+            data = base64.b64decode(b64)
+            if len(data) > MAX_IMAGE:
+                return {"error": "Картинка больше 25 МБ"}
+            os.makedirs(PASTE_DIR, exist_ok=True)
+            base = os.path.splitext(os.path.basename(str(name or "")))[0] or "Картинка"
+            base = "".join(c for c in base if c not in '\\/:*?"<>|')[:60] or "Картинка"
+            path = os.path.join(PASTE_DIR, f"{base} {time.strftime('%Y-%m-%d %H.%M.%S')}{ext}")
+            n = 1
+            while os.path.exists(path):
+                n += 1
+                path = os.path.join(PASTE_DIR, f"{base} {time.strftime('%Y-%m-%d %H.%M.%S')} ({n}){ext}")
+            with open(path, "wb") as f:
+                f.write(data)
+            return add_attachment(path)
+        except (OSError, ValueError) as e:
+            return {"error": f"Не удалось добавить картинку: {e}"}
+
+    def remove_attachment(self, token):
+        pending_attach.pop(token, None)
+        return True
+
+    def get_image(self, msg_id):
+        try:
+            mime, data = image_bytes(str(msg_id))
+            return {"ok": True, "data": to_data_url(mime, data)}
+        except FileNotFoundError as e:
+            return {"ok": False, "reason": str(e) if str(e) in ("moved", "missing") else "missing"}
+        except Exception:
+            return {"ok": False, "reason": "offline"}
+
+    def save_image(self, msg_id):
+        try:
+            mime, data = image_bytes(str(msg_id))
+        except Exception:
+            return {"ok": False}
+        with lock:
+            name = ((find_msg(msg_id) or {}).get("image") or {}).get("name") or "image.png"
+        res = ui.main.create_file_dialog(webview.FileDialog.SAVE, save_filename=name)
+        path = res[0] if isinstance(res, (list, tuple)) and res else res
+        if not path:
+            return {"ok": False, "cancelled": True}
+        with open(path, "wb") as f:
+            f.write(data)
+        return {"ok": True}
 
     def resend(self, msg_id):
         with lock:
@@ -850,25 +1125,41 @@ def selftest():
         time.sleep(2.5)
         now = time.time()
         me, peer = settings["uid"], "peer-demo"
+        pic_peer = os.path.join(SELFTEST_DIR, "chart.png")
+        pic_mine = os.path.join(SELFTEST_DIR, "mine.png")
+        make_png(pic_peer, 480, 280, (96, 140, 255), (40, 70, 180))
+        make_png(pic_mine, 360, 240, (255, 190, 120), (220, 90, 120))
+        fid_peer, fid_mine = uuid.uuid4().hex, uuid.uuid4().hex
+        shared_files[fid_peer] = pic_peer             # «компьютер собеседника» — этот же, по 127.0.0.1
         demo = [
-            (now - 26 * 3600, False, "Ноутбук", "Привет! Не забудь, завтра созвон в 10:00", {"👍": [me]}),
-            (now - 25.9 * 3600, True, settings["name"], "Помню, спасибо!", {}),
-            (now - 180, True, settings["name"], "Можешь скинуть отчёт по продажам за октябрь?", {}),
+            (now - 26 * 3600, False, "Ноутбук", "Привет! Не забудь, завтра созвон в 10:00", {"👍": [me]}, {}),
+            (now - 25.9 * 3600, True, settings["name"], "Помню, спасибо!", {}, {}),
+            (now - 180, True, settings["name"], "Можешь скинуть отчёт по продажам за октябрь?", {}, {}),
             (now - 120, False, "Ноутбук", "Да, через 10 минут пришлю.\nТам ещё добавила сравнение с сентябрём 📊",
-             {"🔥": [me], "❤️": [peer, me]}),
-            (now - 30, True, settings["name"], "Супер, жду 🙌", {"😂": [peer]}),
+             {"🔥": [me], "❤️": [peer, me]}, {}),
+            (now - 90, False, "Ноутбук", "Вот график 👇", {},
+             {"image": {"id": fid_peer, "name": "chart.png", "size": os.path.getsize(pic_peer), "mime": "image/png"},
+              "ip": "127.0.0.1"}),
+            (now - 40, True, settings["name"], "Супер, спасибо 🙌", {"😂": [peer]}, {"reply": "Вот график"}),
+            (now - 30, True, settings["name"], "", {},
+             {"image": {"id": fid_mine, "name": "mine.png", "size": os.path.getsize(pic_mine),
+                        "mime": "image/png", "path": pic_mine}}),
         ]
         with lock:
             messages.clear()
-            for ts, mine, name, text, reacts in demo:
+            for ts, mine, name, text, reacts, extra in demo:
                 m = {"id": uuid.uuid4().hex, "uid": me if mine else peer, "name": name,
-                     "text": text, "ts": ts, "mine": mine, "reactions": reacts}
+                     "text": text, "ts": ts, "mine": mine, "reactions": reacts, **extra}
+                if extra.get("reply"):
+                    src_m = next(x for x in messages if x["text"].startswith(extra["reply"]))
+                    m["reply"] = {"id": src_m["id"], "name": src_m["name"], "text": "📷 " + src_m["text"]}
                 if mine:
                     m.update(status="read", read_ts=ts + 20)
                 messages.append(m)
             messages[-1]["status"] = "delivered"
             messages[-1].pop("read_ts", None)
             peers["192.168.1.24"] = "Ноутбук"
+            peer_uids[peer] = "127.0.0.1"
         push({"t": "reload"})
         time.sleep(2)
 
@@ -877,11 +1168,15 @@ def selftest():
         checks["reaction_chips"] = (ev("document.querySelectorAll('.chip').length") or 0) >= 4
         checks["day_separators"] = ev("document.querySelectorAll('.day').length") == 2
 
-        checks["status_ticks"] = ev("document.querySelectorAll('.st.read').length") == 2 and \
+        checks["status_ticks"] = ev("document.querySelectorAll('.st.read').length") == 3 and \
             ev("document.querySelectorAll('.st.delivered').length") == 1
         set_status({messages[-1]["id"]}, "read")                   # собеседник прочитал
         time.sleep(0.6)
-        checks["read_receipt"] = ev("document.querySelectorAll('.st.read').length") == 3
+        checks["read_receipt"] = ev("document.querySelectorAll('.st.read').length") == 4
+        time.sleep(1.5)
+        checks["images_loaded"] = ev("[...document.querySelectorAll('.pic img')]"
+                                     ".filter(i => i.complete && i.naturalWidth > 0).length") == 2
+        checks["reply_quote"] = ev("document.querySelectorAll('.msg .quote').length") == 1
         push({"t": "typing", "uid": peer, "name": "Ноутбук", "on": True})
         time.sleep(0.6)
         checks["typing_shown"] = bool(ev("!!document.getElementById('typing')")) and \
@@ -942,6 +1237,21 @@ def selftest():
         checks["notify_settings"] = ev("document.querySelectorAll('.opt').length") == len(SOUNDS)
         screenshot("6-notify-settings")
         ev("document.querySelector('.overlay').remove()")
+
+        # ответ на сообщение + вложение в поле ввода
+        ev("startReply(findMsg(%s))" % json.dumps(messages[3]["id"]))
+        att = add_attachment(pic_mine)
+        ev("addAttach(%s)" % json.dumps(att))
+        ev("ta.value='Отлично, сейчас посмотрю';autosize()")
+        time.sleep(0.8)
+        checks["reply_bar"] = bool(ev("document.getElementById('reply-bar').classList.contains('show')"))
+        checks["attach_tray"] = ev("document.querySelectorAll('#tray .thumb').length") == 1
+        screenshot("8-reply-attach")
+        ev("document.querySelector('.pic img').click()")
+        time.sleep(0.8)
+        checks["lightbox"] = bool(ev("!!document.querySelector('.lightbox img')"))
+        screenshot("9-lightbox")
+        ev("closeLightbox();cancelReply();clearAttach()")
 
         info = check_update()                              # настоящий запрос к GitHub
         checks["update_check"] = bool(info.get("url")) and bool(info.get("version"))
@@ -1384,7 +1694,7 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px 10px 16px;bord
 .dots i:nth-child(2){animation-delay:.18s}
 .dots i:nth-child(3){animation-delay:.36s}
 @keyframes blink{0%,60%,100%{opacity:.3;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
-.who-status.typing-on{color:var(--accent)}
+.who-status.typing-on{color:var(--muted)}
 .failed{font-size:12.5px;color:var(--danger);margin-top:5px;cursor:pointer}
 .failed:hover{text-decoration:underline}
 .empty{text-align:center;color:var(--muted);margin-top:28vh;font-size:14px}
@@ -1392,11 +1702,54 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px 10px 16px;bord
 
 /* поле ввода */
 footer{padding:8px 16px 14px}
-.composer{max-width:720px;margin:0 auto;display:flex;align-items:flex-end;gap:4px;background:var(--input);
-  border:1px solid var(--line);border-radius:18px;padding:5px 5px 5px 14px;transition:border-color .15s}
+.composer{max-width:720px;margin:0 auto;display:flex;flex-direction:column;background:var(--input);
+  border:1px solid var(--line);border-radius:18px;padding:5px;transition:border-color .15s}
+.cin{display:flex;align-items:flex-end;gap:2px}
+.reply-bar{display:none;align-items:center;gap:8px;margin:2px 2px 6px;padding:6px 4px 6px 11px;
+  border-left:3px solid var(--muted);background:var(--bg);border-radius:4px 10px 10px 4px}
+.reply-bar.show{display:flex}
+.rq{flex:1;min-width:0;font-size:13px;line-height:1.35;color:var(--muted)}
+.rq b{display:block;font-weight:600;color:var(--text);font-size:12.5px}
+.rq span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.xbtn{width:26px;height:26px;border-radius:7px;display:grid;place-items:center;color:var(--muted);flex:none}
+.xbtn:hover{background:var(--hover);color:var(--text)}
+.tray{display:none;gap:8px;padding:4px 4px 8px;flex-wrap:wrap}
+.tray.show{display:flex}
+.thumb{position:relative;width:68px;height:68px;border-radius:10px;overflow:hidden;background:var(--mine);
+  border:1px solid var(--line)}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb button{position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:50%;
+  background:rgba(0,0,0,.6);color:#fff;display:grid;place-items:center}
+.quote{border-left:3px solid var(--muted);padding:2px 0 2px 9px;margin:3px 0 7px;font-size:13.5px;line-height:1.35;
+  color:var(--muted);cursor:pointer;max-width:420px}
+.quote b{display:block;font-weight:600;color:var(--text);font-size:12.5px}
+.quote span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap}
+.quote:hover span{color:var(--text)}
+.msg.flash{animation:flash 1.6s ease-out}
+@keyframes flash{0%,30%{background:var(--chip-on)}100%{background:transparent}}
+.msg{border-radius:12px}
+.pic{display:block;margin:3px 0 4px;border-radius:12px;overflow:hidden;background:var(--mine);cursor:zoom-in;
+  max-width:min(360px,100%);width:fit-content}
+.mine .pic{background:var(--bg)}
+.pic img{display:block;max-width:100%;max-height:340px;object-fit:contain}
+.pic.loading{width:240px;height:150px;display:grid;place-items:center;color:var(--muted);cursor:default}
+.pic.missing{display:flex;align-items:center;gap:10px;padding:11px 13px;cursor:default;font-size:13px;line-height:1.4;
+  color:var(--muted);max-width:330px;border:1px dashed var(--line);background:transparent}
+.pic.missing .ic{flex:none}
+.pic.missing .btn{padding:4px 10px;font-size:12.5px;flex:none}
+.lightbox{position:fixed;inset:0;background:rgba(10,10,12,.88);z-index:35;display:flex;flex-direction:column;animation:fade .15s}
+.lb-top{display:flex;align-items:center;gap:8px;padding:10px 12px;color:#fff;font-size:13.5px}
+.lb-top .nm{flex:1;opacity:.8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lb-top .btn{color:#fff;background:rgba(255,255,255,.14)}
+.lb-top .btn:hover{background:rgba(255,255,255,.24)}
+.lb-img{flex:1;display:grid;place-items:center;min-height:0;padding:0 20px 20px}
+.lb-img img{max-width:100%;max-height:calc(100vh - 80px);object-fit:contain;border-radius:6px}
+.dropzone{position:fixed;inset:8px;border:2px dashed var(--accent);border-radius:16px;z-index:30;pointer-events:none;
+  background:color-mix(in srgb,var(--accent) 8%,var(--bg));display:none;place-items:center;color:var(--accent);font-size:15px}
+.dropzone.show{display:grid}
 .composer:focus-within{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}
 textarea{flex:1;border:0;background:transparent;color:var(--text);resize:none;outline:none;font:inherit;
-  padding:7px 0;max-height:160px;line-height:1.4}
+  padding:7px 4px;max-height:160px;line-height:1.4}
 textarea::placeholder{color:var(--muted)}
 .send{width:34px;height:34px;border-radius:50%;background:var(--accent);color:#fff;display:grid;place-items:center;
   transition:opacity .15s,transform .1s}
@@ -1491,13 +1844,19 @@ textarea::placeholder{color:var(--muted)}
 
 <footer>
   <div class="composer">
-    <textarea id="ta" rows="1" placeholder="Сообщение…"></textarea>
-    <button class="icon-btn" id="btn-emoji" title="Эмодзи"></button>
-    <button class="send" id="btn-send" title="Отправить" disabled></button>
+    <div class="reply-bar" id="reply-bar"></div>
+    <div class="tray" id="tray"></div>
+    <div class="cin">
+      <button class="icon-btn" id="btn-attach" title="Добавить картинку"></button>
+      <textarea id="ta" rows="1" placeholder="Сообщение…"></textarea>
+      <button class="icon-btn" id="btn-emoji" title="Эмодзи"></button>
+      <button class="send" id="btn-send" title="Отправить" disabled></button>
+    </div>
   </div>
   <div class="hint">Enter — отправить · Shift+Enter — новая строка</div>
 </footer>
 <div class="toast" id="toast"></div>
+<div class="dropzone" id="dropzone">Отпустите, чтобы прикрепить картинку</div>
 
 <script>
 const REACTIONS=['👍','❤️','😂','😮','😢','🔥','🎉','👎'];
@@ -1507,7 +1866,10 @@ const MONTHS=['января','февраля','марта','апреля','ма�
 const I={
  smilePlus:'<path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/><path d="M16 5h6"/><path d="M19 2v6"/>',
  smile:'<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/>',
- copy:'<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+ reply:'<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
+ image:'<rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/>',
+ imageOff:'<line x1="2" x2="22" y1="2" y2="22"/><path d="M10.41 10.41a2 2 0 1 1-2.83-2.83"/><line x1="13.5" x2="6" y1="13.5" y2="21"/><line x1="18" x2="21" y1="12" y2="15"/><path d="M3.59 3.59A1.99 1.99 0 0 0 3 5v14a2 2 0 0 0 2 2h14c.55 0 1.052-.22 1.41-.59"/><path d="M21 15V5a2 2 0 0 0-2-2H9"/>',
+ x:'<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
  bell:'<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>',
  bellOff:'<path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/><path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="m2 2 20 20"/>',
  sun:'<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
@@ -1607,16 +1969,126 @@ function msgEl(m){
   const t=el('span','time',rel(m.ts));t.dataset.ts=m.ts;t.title=dayLabel(m.ts)+', '+hhmm(m.ts);
   meta.append(el('b',null,m.mine?'Я':m.name),document.createTextNode(' · '),t);
   if(m.mine&&m.status)meta.append(statusEl(m));
-  b.append(meta,el('div','text',m.text));box.append(b);
+  b.append(meta);
+  if(m.reply)b.append(quoteEl(m.reply));
+  if(m.image)b.append(picEl(m));
+  if(m.text||!m.image)b.append(el('div','text',m.text));
+  box.append(b);
   const r=el('div','reactions');fillReactions(r,m);box.append(r);
   const a=el('div','actions');
   const rb=el('button','act act-react');rb.title='Реакция';rb.innerHTML=svg('smilePlus',16);
   rb.onclick=e=>{e.stopPropagation();openPicker(rb,m.id)};
-  const cb=el('button','act');cb.title='Копировать';cb.innerHTML=svg('copy',16);cb.onclick=()=>copy(m.text);
-  a.append(rb,cb);box.append(a);
+  const rp=el('button','act act-reply');rp.title='Ответить';rp.innerHTML=svg('reply',16);rp.onclick=()=>startReply(m);
+  a.append(rb,rp);box.append(a);
   if(m.failed)box.append(failedEl(m.id));
   return box;
 }
+/* ---------- цитата и картинка в сообщении ---------- */
+function quoteEl(r){
+  const q=el('div','quote');q.title='Перейти к сообщению';
+  q.append(el('b',null,r.name===S.me.name?'Я':r.name),el('span',null,r.text||'…'));
+  q.onclick=()=>jumpTo(r.id);return q;
+}
+function jumpTo(id){
+  const box=col.querySelector(`.msg[data-id="${CSS.escape(id)}"]`);
+  if(!box){toast('Исходное сообщение не найдено');return}
+  box.scrollIntoView({block:'center',behavior:'smooth'});
+  box.classList.remove('flash');void box.offsetWidth;box.classList.add('flash');
+}
+const imgCache={};
+function picEl(m){
+  const p=el('div','pic loading');p.dataset.id=m.id;
+  p.innerHTML=svg('image',22,1.5);loadPic(p,m);return p;
+}
+async function loadPic(p,m){
+  const r=imgCache[m.id]?{ok:true,data:imgCache[m.id]}:await api().get_image(m.id);
+  p.textContent='';
+  if(r.ok){
+    imgCache[m.id]=r.data;
+    const nearBottom=feed.scrollHeight-feed.scrollTop-feed.clientHeight<160;
+    const img=new Image();img.alt=m.image.name||'';img.src=r.data;
+    img.onload=()=>{if(nearBottom)feed.scrollTop=feed.scrollHeight};
+    p.className='pic';p.append(img);p.onclick=()=>openLightbox(m);
+    return;
+  }
+  p.className='pic missing'+(r.reason==='offline'?' offline':'');p.onclick=null;
+  const ic=el('span','ic');ic.innerHTML=svg('imageOff',20,1.5);
+  const txt=r.reason==='offline'?`Картинка хранится на компьютере «${m.name}». Сейчас он не в сети.`
+    :r.reason==='moved'?'Файл перемещён или удалён с этого компьютера.'
+    :'Отправитель удалил или переместил этот файл.';
+  p.append(ic,el('span',null,txt));
+  if(r.reason==='offline'){const b=el('button','btn ghost','Повторить');b.onclick=e=>{e.stopPropagation();
+    p.className='pic loading';p.innerHTML=svg('image',22,1.5);loadPic(p,m)};p.append(b)}
+}
+function retryOfflinePics(){
+  document.querySelectorAll('.pic.offline').forEach(p=>{const m=findMsg(p.dataset.id);
+    if(m){p.className='pic loading';p.innerHTML=svg('image',22,1.5);loadPic(p,m)}});
+}
+function openLightbox(m){
+  closeLightbox();
+  const o=el('div','lightbox'),top=el('div','lb-top'),wrap=el('div','lb-img'),img=new Image();
+  img.src=imgCache[m.id];img.alt=m.image.name||'';
+  const save=el('button','btn','Сохранить…');
+  save.onclick=async e=>{e.stopPropagation();const r=await api().save_image(m.id);if(r&&r.ok)toast('Картинка сохранена')};
+  const cl=el('button','btn','Закрыть');cl.onclick=closeLightbox;
+  top.append(el('span','nm',(m.mine?'Я':m.name)+' · '+(m.image.name||'')),save,cl);
+  wrap.append(img);o.append(top,wrap);
+  wrap.onclick=e=>{if(e.target===wrap)closeLightbox()};
+  document.body.append(o);
+}
+function closeLightbox(){document.querySelector('.lightbox')?.remove()}
+
+/* ---------- ответ ---------- */
+let replyTo=null;
+function startReply(m){
+  replyTo={id:m.id,name:m.mine?S.me.name:m.name,
+    text:(m.image?'📷 '+(m.text||'Картинка'):m.text).slice(0,300)};
+  const bar=$('#reply-bar');bar.textContent='';bar.classList.add('show');
+  const q=el('div','rq');q.append(el('b',null,'Ответ: '+(m.mine?'себе':m.name)),el('span',null,replyTo.text));
+  const x=el('button','xbtn');x.title='Отменить ответ';x.innerHTML=svg('x',15,2);x.onclick=cancelReply;
+  bar.append(q,x);closeAll();ta.focus();
+}
+function cancelReply(){replyTo=null;const bar=$('#reply-bar');bar.classList.remove('show');bar.textContent=''}
+
+/* ---------- вложения ---------- */
+let attach=[];
+function addAttach(a){
+  if(!a)return;
+  if(a.error){toast(a.error,3000);return}
+  attach.push(a);renderTray();
+}
+function renderTray(){
+  const t=$('#tray');t.textContent='';t.classList.toggle('show',attach.length>0);
+  for(const a of attach){
+    const th=el('div','thumb');th.title=a.name;const img=new Image();img.src=a.thumb;
+    const x=el('button');x.title='Убрать';x.innerHTML=svg('x',12,2.4);
+    x.onclick=()=>{attach=attach.filter(z=>z!==a);api().remove_attachment(a.token);renderTray()};
+    th.append(img,x);t.append(th);
+  }
+  autosize();
+}
+function clearAttach(){for(const a of attach)api().remove_attachment(a.token);attach=[];renderTray()}
+$('#btn-attach').onclick=async()=>{closeAll();const list=await api().pick_images();(list||[]).forEach(addAttach);ta.focus()};
+function readFile(f){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(f)})}
+async function addFiles(files){
+  for(const f of files){
+    if(!f.type.startsWith('image/')){toast('Можно прикреплять только картинки',2500);continue}
+    if(f.size>25*1024*1024){toast('Картинка больше 25 МБ',2500);continue}
+    addAttach(await api().add_image_data(f.name||'Картинка',await readFile(f)));
+  }
+  ta.focus();
+}
+ta.addEventListener('paste',e=>{
+  const files=[...(e.clipboardData?.items||[])].filter(i=>i.kind==='file'&&i.type.startsWith('image/')).map(i=>i.getAsFile()).filter(Boolean);
+  if(files.length){e.preventDefault();addFiles(files)}
+});
+let dragDepth=0;
+document.addEventListener('dragenter',e=>{if([...(e.dataTransfer?.types||[])].includes('Files')){dragDepth++;$('#dropzone').classList.add('show')}});
+document.addEventListener('dragleave',()=>{if(--dragDepth<=0){dragDepth=0;$('#dropzone').classList.remove('show')}});
+document.addEventListener('dragover',e=>e.preventDefault());
+document.addEventListener('drop',e=>{e.preventDefault();dragDepth=0;$('#dropzone').classList.remove('show');
+  const files=[...(e.dataTransfer?.files||[])];if(files.length)addFiles(files)});
+
 function statusEl(m){
   const s=el('span','st '+m.status);
   if(m.status==='read'){s.innerHTML=svg('ticks',16,2);s.title='Прочитано'+(m.read_ts?' в '+hhmm(m.read_ts):'')}
@@ -1676,6 +2148,7 @@ function renderIcons(){
   $('#btn-theme').innerHTML=svg({light:'sun',dark:'moon',system:'monitor'}[S.theme]);
   $('#btn-more').innerHTML=svg('more');
   $('#btn-emoji').innerHTML=svg('smile');
+  $('#btn-attach').innerHTML=svg('image');
   $('#btn-send').innerHTML=svg('send',18,2.2);
 }
 function muteLabel(){
@@ -1827,11 +2300,14 @@ function insert(t){
   ta.focus();autosize();
 }
 document.addEventListener('click',e=>{if(!e.target.closest('.menu,.picker,.grid'))closeAll()});
-document.addEventListener('keydown',e=>{if(e.key==='Escape')closeAll()});
+document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;
+  if(document.querySelector('.lightbox')){closeLightbox();return}
+  if(document.querySelector('.menu,.picker,.grid')){closeAll();return}
+  if(replyTo)cancelReply();});
 
 /* ---------- отправка ---------- */
 function autosize(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  $('#btn-send').disabled=!ta.value.trim()}
+  $('#btn-send').disabled=!ta.value.trim()&&!attach.length}
 ta.addEventListener('input',()=>{autosize();typingSignal()});
 let typingSent=0;
 function typingSignal(){
@@ -1842,19 +2318,14 @@ function typingSignal(){
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}});
 $('#btn-send').onclick=send;
 async function send(){
-  const v=ta.value.trim();if(!v)return;
-  ta.value='';autosize();closeAll();typingSent=0;
-  const m=await api().send(v);
-  if(m&&!findMsg(m.id)){if(failedIds.has(m.id))m.failed=true;S.messages.push(m);appendMsg(m)}
+  const v=ta.value.trim();if(!v&&!attach.length)return;
+  const tokens=attach.map(a=>a.token),reply=replyTo;
+  ta.value='';attach=[];renderTray();cancelReply();autosize();closeAll();typingSent=0;
+  const list=await api().send(v,reply,tokens);
+  for(const m of list||[]){if(!findMsg(m.id)){if(failedIds.has(m.id))m.failed=true;S.messages.push(m);appendMsg(m)}}
 }
 
 /* ---------- прочее ---------- */
-function copy(t){
-  const x=el('textarea');x.value=t;x.style.cssText='position:fixed;opacity:0';document.body.append(x);x.select();
-  let ok=false;try{ok=document.execCommand('copy')}catch(e){}
-  x.remove();if(!ok&&navigator.clipboard)navigator.clipboard.writeText(t).catch(()=>{});
-  toast('Скопировано');
-}
 let toastTimer;
 function toast(t,ms){const n=$('#toast');n.textContent=t;n.classList.add('show');
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>n.classList.remove('show'),ms||1800)}
@@ -1925,7 +2396,7 @@ const app={
       case'status':updateStatus(e.ids,e.status,e.ts);break;
       case'typing':setTyping(e.uid,e.name,e.on);break;
       case'react':{const m=findMsg(e.id);if(m){m.reactions=e.reactions;updateReactions(e.id)}break}
-      case'peers':S.peers=e.peers;renderHeader();if(col.querySelector('.empty'))render();break;
+      case'peers':S.peers=e.peers;renderHeader();if(col.querySelector('.empty'))render();if(S.peers.length)retryOfflinePics();break;
       case'failed':{
         const m=findMsg(e.id);if(m)m.failed=true;else failedIds.add(e.id);
         const box=col.querySelector(`.msg[data-id="${CSS.escape(e.id)}"]`);
