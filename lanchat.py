@@ -27,7 +27,7 @@ import webbrowser
 import webview
 
 APP_NAME = "LANChat"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 APP_ID = "lanchat"
 TCP_PORT = 50505
 UDP_PORT = 50506
@@ -422,6 +422,7 @@ def on_closing():
 
 def on_loaded():
     ui.ready = True
+    update_title()
     if SELFTEST_DIR:
         threading.Thread(target=selftest, daemon=True).start()
 
@@ -437,8 +438,11 @@ def add_peer(ip, name):
     with lock:
         if peers.get(ip) == name:
             return
+        is_new = ip not in peers
         peers[ip] = name
     push({"t": "peers", "peers": peers_list()})
+    if is_new:
+        threading.Thread(target=flush_receipts, daemon=True).start()
 
 
 def udp_announcer():
@@ -518,7 +522,7 @@ def handle_client(conn, ip):
              "uid": str(data.get("uid", ""))[:64],
              "name": str(data.get("name", ip))[:40],
              "text": str(data.get("text", ""))[:10000],
-             "ts": time.time(), "mine": False, "reactions": {}}
+             "ts": time.time(), "mine": False, "reactions": {}, "unread": True}
         with lock:
             if find_msg(m["id"]):
                 return
@@ -526,7 +530,18 @@ def handle_client(conn, ip):
         save_history()
         add_peer(ip, m["name"])
         push({"t": "msg", "msg": m})
+        update_title()
         notify(m["name"], m["text"])
+
+    elif kind == "read":
+        ids = data.get("ids")
+        if isinstance(ids, list):
+            set_status({str(i)[:64] for i in ids[:5000]}, "read")
+
+    elif kind == "typing":
+        add_peer(ip, str(data.get("name", ip))[:40])
+        push({"t": "typing", "uid": str(data.get("uid", ""))[:64],
+              "name": str(data.get("name", ip))[:40], "on": bool(data.get("on"))})
 
     elif kind == "react":
         emoji = str(data.get("emoji", ""))[:16]
@@ -554,13 +569,13 @@ def tcp_server(srv):
         threading.Thread(target=handle_client, args=(conn, ip), daemon=True).start()
 
 
-def send_payload(payload):
+def send_payload(payload, timeout=3):
     """Отправляет всем собеседникам. Возвращает True, если хоть кто-то получил."""
     raw = json.dumps(payload, ensure_ascii=False).encode()
     delivered = False
     for p in peers_list():
         try:
-            with socket.create_connection((p["ip"], TCP_PORT), timeout=3) as s:
+            with socket.create_connection((p["ip"], TCP_PORT), timeout=timeout) as s:
                 s.sendall(raw)
             delivered = True
         except OSError:
@@ -577,8 +592,75 @@ def deliver(m):
         else:
             m["failed"] = True
     save_history()
-    if not ok:
+    if ok:
+        set_status({m["id"]}, "delivered")
+    else:
         push({"t": "failed", "id": m["id"]})
+
+
+# ---------- Доставлено / прочитано ----------
+
+STATUS_RANK = {"sending": 0, "delivered": 1, "read": 2}
+receipt_lock = threading.Lock()
+
+
+def set_status(ids, status):
+    """Мои сообщения: «отправляется» -> «доставлено» -> «прочитано» (только вперёд)."""
+    changed, now = [], time.time()
+    with lock:
+        for m in messages:
+            if m.get("mine") and m["id"] in ids and \
+                    STATUS_RANK.get(m.get("status"), 1) < STATUS_RANK[status]:
+                m["status"] = status
+                m.pop("failed", None)
+                if status == "read":
+                    m["read_ts"] = now
+                changed.append(m["id"])
+    if changed:
+        save_history()
+        push({"t": "status", "ids": changed, "status": status, "ts": now})
+
+
+def unread_count():
+    with lock:
+        return sum(1 for m in messages if not m.get("mine") and m.get("unread"))
+
+
+def update_title():
+    n = unread_count()
+    try:
+        ui.main.set_title(f"({n}) LAN Chat" if n else "LAN Chat")
+    except Exception:
+        pass
+
+
+def flush_receipts():
+    """Отправляет собеседнику отметки «прочитано». Если он не в сети — дошлём позже."""
+    with receipt_lock:
+        with lock:
+            ids = [m["id"] for m in messages if m.get("receipt_pending")]
+        if not ids or not peers_list():
+            return
+        if send_payload({"type": "read", "uid": settings["uid"], "ids": ids}):
+            with lock:
+                for m in messages:
+                    if m["id"] in ids:
+                        m.pop("receipt_pending", None)
+            save_history()
+
+
+def mark_all_read():
+    changed = False
+    with lock:
+        for m in messages:
+            if not m.get("mine") and m.get("unread"):
+                m["unread"] = False
+                m["receipt_pending"] = True
+                changed = True
+    if changed:
+        save_history()
+        update_title()
+    flush_receipts()
 
 
 # ---------- Мост «интерфейс → программа» ----------
@@ -621,12 +703,20 @@ class Api:
     def on_focus(self):
         threading.Thread(target=close_popup, daemon=True).start()
 
+    def mark_read(self):
+        threading.Thread(target=mark_all_read, daemon=True).start()
+
+    def typing(self, on):
+        threading.Thread(target=send_payload, daemon=True, args=(
+            {"type": "typing", "uid": settings["uid"], "name": settings["name"], "on": bool(on)},),
+            kwargs={"timeout": 1}).start()
+
     def send(self, text):
         text = str(text or "").strip()[:10000]
         if not text:
             return None
         m = {"id": uuid.uuid4().hex, "uid": settings["uid"], "name": settings["name"],
-             "text": text, "ts": time.time(), "mine": True, "reactions": {}}
+             "text": text, "ts": time.time(), "mine": True, "reactions": {}, "status": "sending"}
         with lock:
             messages.append(m)
         save_history()
@@ -749,8 +839,13 @@ def selftest():
         with lock:
             messages.clear()
             for ts, mine, name, text, reacts in demo:
-                messages.append({"id": uuid.uuid4().hex, "uid": me if mine else peer, "name": name,
-                                 "text": text, "ts": ts, "mine": mine, "reactions": reacts})
+                m = {"id": uuid.uuid4().hex, "uid": me if mine else peer, "name": name,
+                     "text": text, "ts": ts, "mine": mine, "reactions": reacts}
+                if mine:
+                    m.update(status="read", read_ts=ts + 20)
+                messages.append(m)
+            messages[-1]["status"] = "delivered"
+            messages[-1].pop("read_ts", None)
             peers["192.168.1.24"] = "Ноутбук"
         push({"t": "reload"})
         time.sleep(2)
@@ -760,9 +855,20 @@ def selftest():
         checks["reaction_chips"] = (ev("document.querySelectorAll('.chip').length") or 0) >= 4
         checks["day_separators"] = ev("document.querySelectorAll('.day').length") == 2
 
+        checks["status_ticks"] = ev("document.querySelectorAll('.st.read').length") == 2 and \
+            ev("document.querySelectorAll('.st.delivered').length") == 1
+        set_status({messages[-1]["id"]}, "read")                   # собеседник прочитал
+        time.sleep(0.6)
+        checks["read_receipt"] = ev("document.querySelectorAll('.st.read').length") == 3
+        push({"t": "typing", "uid": peer, "name": "Ноутбук", "on": True})
+        time.sleep(0.6)
+        checks["typing_shown"] = bool(ev("!!document.getElementById('typing')")) and \
+            "печатает" in (ev("document.getElementById('status').textContent") or "")
+
         ev("app.applyTheme('light')")
         time.sleep(1.2)
         screenshot("1-light")
+        push({"t": "typing", "uid": peer, "name": "Ноутбук", "on": False})
 
         target = messages[3]["id"]
         before = "😮" in messages[3]["reactions"]
@@ -1050,6 +1156,18 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px 10px 16px;bord
 .msg.mine:hover .actions,.msg.mine .actions:focus-within{opacity:1}
 .act{width:28px;height:28px;border-radius:7px;display:grid;place-items:center;color:var(--muted)}
 .act:hover{background:var(--hover);color:var(--text)}
+.st{display:inline-flex;vertical-align:-3px;margin-left:5px;color:var(--muted)}
+.st.read{color:var(--accent)}
+.st.sending{opacity:.6}
+.typing{display:flex;align-items:center;gap:9px;margin:2px 0 14px;color:var(--muted);font-size:13.5px;
+  animation:in .18s ease-out}
+.typing b{font-weight:500;color:var(--text)}
+.dots{display:inline-flex;gap:4px;background:var(--mine);border-radius:12px;padding:9px 11px}
+.dots i{width:6px;height:6px;border-radius:50%;background:var(--muted);animation:blink 1.3s infinite ease-in-out}
+.dots i:nth-child(2){animation-delay:.18s}
+.dots i:nth-child(3){animation-delay:.36s}
+@keyframes blink{0%,60%,100%{opacity:.3;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
+.who-status.typing-on{color:var(--accent)}
 .failed{font-size:12.5px;color:var(--danger);margin-top:5px;cursor:pointer}
 .failed:hover{text-decoration:underline}
 .empty{text-align:center;color:var(--muted);margin-top:28vh;font-size:14px}
@@ -1166,6 +1284,9 @@ const I={
  moon:'<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
  monitor:'<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>',
  sliders:'<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/><line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/><line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/><line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/><line x1="16" x2="16" y1="18" y2="22"/>',
+ tick:'<path d="M4 12.5l4.5 4.5L19 6.5"/>',
+ ticks:'<path d="M1.5 12.5L6 17 16.5 6.5"/><path d="M11 16l1 1L22.5 6.5"/>',
+ clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
  more:'<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
  send:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
  check:'<path d="M20 6 9 17l-5-5"/>',
@@ -1213,14 +1334,38 @@ function render(){
     if(dayKey(m.ts)!==last){col.append(el('div','day',dayLabel(m.ts)));last=dayKey(m.ts)}
     col.append(msgEl(m));
   }
+  renderTyping(true);
   feed.style.scrollBehavior='auto';feed.scrollTop=feed.scrollHeight;feed.style.scrollBehavior='';
 }
+const typing={};
+function setTyping(uid,name,on){
+  if(on)typing[uid]={name,until:Date.now()+6000};else delete typing[uid];
+  renderTyping();renderHeader();
+}
+function activeTyping(){
+  const t=Date.now();for(const k in typing)if(typing[k].until<t)delete typing[k];
+  return Object.values(typing);
+}
+function renderTyping(noScroll){
+  const list=activeTyping(),old=document.getElementById('typing');
+  const nearBottom=feed.scrollHeight-feed.scrollTop-feed.clientHeight<120;
+  if(old)old.remove();
+  if(!list.length||col.querySelector('.empty'))return;
+  const t=el('div','typing');t.id='typing';
+  const dots=el('span','dots');dots.innerHTML='<i></i><i></i><i></i>';
+  const txt=el('span');txt.append(el('b',null,list[0].name),document.createTextNode(' печатает…'));
+  t.append(dots,txt);col.append(t);
+  if(!noScroll&&nearBottom)feed.scrollTop=feed.scrollHeight;
+}
+setInterval(()=>{if(Object.keys(typing).length){const n=Object.keys(typing).length;activeTyping();
+  if(Object.keys(typing).length!==n){renderTyping();renderHeader()}}},1000);
 function appendMsg(m){
   if(col.querySelector('.empty')){render();return}
   const nearBottom=feed.scrollHeight-feed.scrollTop-feed.clientHeight<120;
   const prev=S.messages[S.messages.length-2];
   if(!prev||dayKey(prev.ts)!==dayKey(m.ts))col.append(el('div','day',dayLabel(m.ts)));
   col.append(msgEl(m));
+  renderTyping(true);
   if(m.mine||nearBottom)feed.scrollTop=feed.scrollHeight;
 }
 function msgEl(m){
@@ -1228,6 +1373,7 @@ function msgEl(m){
   const b=el('div','bubble'),meta=el('div','meta');
   const t=el('span','time',rel(m.ts));t.dataset.ts=m.ts;t.title=dayLabel(m.ts)+', '+hhmm(m.ts);
   meta.append(el('b',null,m.mine?'Я':m.name),document.createTextNode(' · '),t);
+  if(m.mine&&m.status)meta.append(statusEl(m));
   b.append(meta,el('div','text',m.text));box.append(b);
   const r=el('div','reactions');fillReactions(r,m);box.append(r);
   const a=el('div','actions');
@@ -1237,6 +1383,22 @@ function msgEl(m){
   a.append(rb,cb);box.append(a);
   if(m.failed)box.append(failedEl(m.id));
   return box;
+}
+function statusEl(m){
+  const s=el('span','st '+m.status);
+  if(m.status==='read'){s.innerHTML=svg('ticks',16,2);s.title='Прочитано'+(m.read_ts?' в '+hhmm(m.read_ts):'')}
+  else if(m.status==='delivered'){s.innerHTML=svg('tick',15,2);s.title='Доставлено, ещё не прочитано'}
+  else{s.innerHTML=svg('clock',13,2);s.title='Отправляется…'}
+  return s;
+}
+function updateStatus(ids,status,ts){
+  for(const id of ids){
+    const m=findMsg(id);if(!m)continue;
+    m.status=status;if(status==='read')m.read_ts=ts;m.failed=false;
+    const box=col.querySelector(`.msg[data-id="${CSS.escape(id)}"]`);if(!box)continue;
+    box.querySelector('.failed')?.remove();
+    const meta=box.querySelector('.meta');meta.querySelector('.st')?.remove();meta.append(statusEl(m));
+  }
 }
 function failedEl(id){
   const f=el('div','failed','Не доставлено · повторить');
@@ -1267,11 +1429,12 @@ async function react(id,e){
 /* ---------- шапка и иконки ---------- */
 function isMuted(){return S.mute===-1||now()<S.mute}
 function renderHeader(){
-  const p=S.peers[0];
+  const p=S.peers[0],ty=activeTyping();
   $('#peer-name').textContent=p?p.name:'LAN Chat';
   $('#avatar').textContent=p?(p.name.trim()[0]||'·').toUpperCase():'·';
-  $('#dot').className='dot'+(p?' on':'');
-  $('#status').textContent=p?(S.peers.length>1?'в сети, ещё '+(S.peers.length-1):'в сети'):'ищу собеседника в сети…';
+  $('#dot').className='dot'+(p||ty.length?' on':'');
+  const st=$('#status');st.parentElement.classList.toggle('typing-on',ty.length>0);
+  st.textContent=ty.length?'печатает…':p?(S.peers.length>1?'в сети, ещё '+(S.peers.length-1):'в сети'):'ищу собеседника в сети…';
 }
 function renderIcons(){
   const m=isMuted(),bm=$('#btn-mute');
@@ -1394,7 +1557,12 @@ function notifySettings(){
   ok.onclick=done;o.onclick=e=>{if(e.target===o)done()};document.addEventListener('keydown',esc);
   row.append(test,ok);d.append(row);o.append(d);document.body.append(o);
 }
-window.addEventListener('focus',()=>{if(window.pywebview&&pywebview.api)api().on_focus()});
+function markRead(){
+  if(!(window.pywebview&&pywebview.api)||!document.hasFocus()||document.hidden)return;
+  if(S.messages.some(m=>!m.mine&&m.unread)){S.messages.forEach(m=>{if(!m.mine)m.unread=false});api().mark_read()}
+}
+window.addEventListener('focus',()=>{if(window.pywebview&&pywebview.api){api().on_focus();markRead()}});
+document.addEventListener('visibilitychange',markRead);
 
 /* ---------- реакции и эмодзи ---------- */
 function openPicker(btn,id){
@@ -1430,12 +1598,18 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape')closeAll()});
 /* ---------- отправка ---------- */
 function autosize(){ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
   $('#btn-send').disabled=!ta.value.trim()}
-ta.addEventListener('input',autosize);
+ta.addEventListener('input',()=>{autosize();typingSignal()});
+let typingSent=0;
+function typingSignal(){
+  if(ta.value.trim()){
+    if(Date.now()-typingSent>2500){typingSent=Date.now();api().typing(true)}
+  }else if(typingSent){typingSent=0;api().typing(false)}
+}
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();send()}});
 $('#btn-send').onclick=send;
 async function send(){
   const v=ta.value.trim();if(!v)return;
-  ta.value='';autosize();closeAll();
+  ta.value='';autosize();closeAll();typingSent=0;
   const m=await api().send(v);
   if(m&&!findMsg(m.id)){if(failedIds.has(m.id))m.failed=true;S.messages.push(m);appendMsg(m)}
 }
@@ -1475,7 +1649,10 @@ const failedIds=new Set();
 const app={
   onEvent(e){
     switch(e.t){
-      case'msg':if(!findMsg(e.msg.id)){S.messages.push(e.msg);appendMsg(e.msg)}break;
+      case'msg':if(!findMsg(e.msg.id)){delete typing[e.msg.uid];renderHeader();
+        S.messages.push(e.msg);appendMsg(e.msg);markRead()}break;
+      case'status':updateStatus(e.ids,e.status,e.ts);break;
+      case'typing':setTyping(e.uid,e.name,e.on);break;
       case'react':{const m=findMsg(e.id);if(m){m.reactions=e.reactions;updateReactions(e.id)}break}
       case'peers':S.peers=e.peers;renderHeader();if(col.querySelector('.empty'))render();break;
       case'failed':{
@@ -1498,7 +1675,7 @@ async function load(){
     S.me=st.me;S.messages=st.messages;S.peers=st.peers;S.mute=st.mute_until;S.autostart=st.autostart;S.ip=st.ip;
     S.sound=st.sound;S.sounds=st.sounds;S.popupTime=st.popup_time;S.version=st.version;
     for(const id of failedIds){const m=findMsg(id);if(m)m.failed=true}
-    applyTheme(st.theme,false);renderHeader();render();ta.focus();
+    applyTheme(st.theme,false);renderHeader();render();ta.focus();markRead();
   }finally{loading=false}
 }
 renderIcons();

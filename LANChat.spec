@@ -19,6 +19,6 @@ if sys.platform == 'darwin':
             'NSLocalNetworkUsageDescription':
                 'LAN Chat обменивается сообщениями с компьютерами в вашей Wi-Fi сети.',
             'NSHighResolutionCapable': True,
-            'CFBundleShortVersionString': '2.1',
+            'CFBundleShortVersionString': '2.2',
         },
     )

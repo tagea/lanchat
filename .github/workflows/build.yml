@@ -103,7 +103,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="v2.1.${{ github.run_number }}"
+          tag="v2.2.${{ github.run_number }}"
           gh release create "$tag" -R "${{ github.repository }}" --latest \
             --title "LAN Chat $tag" \
             --notes "Windows: скачайте LANChat-Setup.exe и запустите. Mac: скачайте LANChat-mac.zip, распакуйте и перетащите LANChat.app в «Программы»." \

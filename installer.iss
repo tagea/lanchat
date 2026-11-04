@@ -3,7 +3,7 @@
 ; доустанавливает Microsoft WebView2, без которого интерфейс не открывается.
 
 #ifndef AppVer
-  #define AppVer "2.1"
+  #define AppVer "2.2"
 #endif
 
 [Setup]
