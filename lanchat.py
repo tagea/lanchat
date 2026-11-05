@@ -1134,7 +1134,7 @@ def selftest():
         demo = [
             (now - 26 * 3600, False, "Ноутбук", "Привет! Не забудь, завтра созвон в 10:00", {"👍": [me]}, {}),
             (now - 25.9 * 3600, True, settings["name"], "Помню, спасибо!", {}, {}),
-            (now - 180, True, settings["name"], "Можешь скинуть отчёт по продажам за октябрь?", {}, {}),
+            (now - 180, True, settings["name"], "Можешь скинуть отчёт по продажам за октябрь?", {"⏳5мин": [peer]}, {}),
             (now - 120, False, "Ноутбук", "Да, через 10 минут пришлю.\nТам ещё добавила сравнение с сентябрём 📊",
              {"🔥": [me], "❤️": [peer, me]}, {}),
             (now - 90, False, "Ноутбук", "Вот график 👇", {},
@@ -1779,6 +1779,9 @@ textarea::placeholder{color:var(--muted)}
 .picker button{width:36px;height:36px;border-radius:50%;font-size:20px;display:grid;place-items:center;transition:transform .1s}
 .picker button:hover{background:var(--hover);transform:scale(1.18)}
 .picker button.on{background:var(--chip-on)}
+.picker button.wide{width:auto;padding:0 11px;border-radius:18px;font-size:13.5px;white-space:nowrap;gap:4px;
+  display:flex;align-items:center;margin-left:2px;border:1px solid var(--line)}
+.picker button.wide:hover{transform:scale(1.06)}
 .grid{position:fixed;z-index:20;display:grid;grid-template-columns:repeat(8,34px);gap:2px;padding:8px;
   background:var(--menu);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);animation:pop .12s ease-out}
 .grid button{width:34px;height:34px;border-radius:8px;font-size:19px}
@@ -1861,7 +1864,9 @@ textarea::placeholder{color:var(--muted)}
 <div class="dropzone" id="dropzone">Отпустите, чтобы прикрепить картинку</div>
 
 <script>
-const REACTIONS=['👍','❤️','😂','😮','😢','🔥','🎉','👎'];
+const REACTIONS=['👍','❤️','😂','😮','😢','🔥','🎉','👎','⏳5мин'];
+const REACTION_LABELS={'⏳5мин':'⏳ 5 мин'};   // реакции-фразы
+const rLabel=e=>REACTION_LABELS[e]||e;
 const EMOJI=['😀','😂','🥲','😊','😍','😘','😎','🤔','😅','😉','🙃','😴','😭','😱','🤗','🥳',
              '👍','👎','👏','🙏','💪','👋','🤝','🙌','❤️','🔥','🎉','✨','✅','❌','☕','💬'];
 const MONTHS=['января','февраля','марта','апреля','мая','июня','июля','августа','сентября','октября','ноября','декабря'];
@@ -2117,7 +2122,7 @@ function fillReactions(r,m){
   for(const [e,users] of Object.entries(m.reactions||{})){
     if(!users.length)continue;
     const c=el('button','chip'+(users.includes(S.me.uid)?' on':''));
-    c.append(el('span',null,e),el('span','n',String(users.length)));
+    c.append(el('span',null,rLabel(e)),el('span','n',String(users.length)));
     c.title=users.includes(S.me.uid)?'Нажмите, чтобы убрать':'Нажмите, чтобы добавить';
     c.onclick=()=>react(m.id,e);r.append(c);
   }
@@ -2278,7 +2283,8 @@ function openPicker(btn,id){
   closeAll();
   const m=findMsg(id),p=el('div','picker');
   for(const e of REACTIONS){
-    const b=el('button',(m.reactions?.[e]||[]).includes(S.me.uid)?'on':'',e);
+    const b=el('button',((m.reactions?.[e]||[]).includes(S.me.uid)?'on ':'')+(REACTION_LABELS[e]?'wide':''),rLabel(e));
+    if(REACTION_LABELS[e])b.title='Буду через 5 минут';
     b.onclick=ev=>{ev.stopPropagation();react(id,e)};p.append(b);
   }
   // сбоку от кнопки, чтобы не закрывать текст сообщения
