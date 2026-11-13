@@ -1074,6 +1074,14 @@ class Api:
     def update_now(self):
         threading.Thread(target=run_update, daemon=True).start()
 
+    def open_url(self, url):
+        """Ссылка из сообщения открывается в обычном браузере, а не в окне чата."""
+        url = str(url or "").strip()
+        if re.match(r"^https?://[^\s]+$", url, re.I) and len(url) <= 4000:
+            webbrowser.open(url)
+            return True
+        return False
+
     def open_releases(self):
         webbrowser.open(RELEASES_PAGE)
 
@@ -1135,7 +1143,7 @@ def selftest():
             (now - 26 * 3600, False, "Ноутбук", "Привет! Не забудь, завтра созвон в 10:00", {"👍": [me]}, {}),
             (now - 25.9 * 3600, True, settings["name"], "Помню, спасибо!", {}, {}),
             (now - 180, True, settings["name"], "Можешь скинуть отчёт по продажам за октябрь?", {"⏳5мин": [peer]}, {}),
-            (now - 120, False, "Ноутбук", "Да, через 10 минут пришлю.\nТам ещё добавила сравнение с сентябрём 📊",
+            (now - 120, False, "Ноутбук", "Да, через 10 минут пришлю.\nТам ещё добавила сравнение с сентябрём 📊 Источник: https://example.com/report.",
              {"🔥": [me], "❤️": [peer, me]}, {}),
             (now - 90, False, "Ноутбук", "Вот график 👇", {},
              {"image": {"id": fid_peer, "name": "chart.png", "size": os.path.getsize(pic_peer), "mime": "image/png"},
@@ -1177,6 +1185,7 @@ def selftest():
         checks["images_loaded"] = ev("[...document.querySelectorAll('.pic img')]"
                                      ".filter(i => i.complete && i.naturalWidth > 0).length") == 2
         checks["reply_quote"] = ev("document.querySelectorAll('.msg .quote').length") == 1
+        checks["links"] = ev("[...document.querySelectorAll('.text a')].map(a => a.dataset.url).join()") == "https://example.com/report"
         push({"t": "typing", "uid": peer, "name": "Ноутбук", "on": True})
         time.sleep(0.6)
         checks["typing_shown"] = bool(ev("!!document.getElementById('typing')")) and \
@@ -1671,6 +1680,9 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px 10px 16px;bord
 .meta{font-size:13.5px;color:var(--muted);margin-bottom:3px;white-space:nowrap}
 .meta b{font-weight:500;color:var(--text)}
 .text{white-space:pre-wrap;overflow-wrap:anywhere;-webkit-user-select:text;user-select:text}
+.text a{color:var(--accent);text-decoration:underline;text-decoration-color:color-mix(in srgb,var(--accent) 40%,transparent);
+  text-underline-offset:2px;cursor:pointer;word-break:break-all}
+.text a:hover{text-decoration-color:var(--accent)}
 .reactions{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .chip{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 9px;border-radius:999px;
   background:var(--chip);border:1px solid transparent;font-size:14px;transition:transform .1s,background .12s}
@@ -1979,7 +1991,7 @@ function msgEl(m){
   b.append(meta);
   if(m.reply)b.append(quoteEl(m.reply));
   if(m.image)b.append(picEl(m));
-  if(m.text||!m.image)b.append(el('div','text',m.text));
+  if(m.text||!m.image)b.append(textEl(m.text));
   box.append(b);
   const r=el('div','reactions');fillReactions(r,m);box.append(r);
   const a=el('div','actions');
@@ -1990,6 +2002,39 @@ function msgEl(m){
   if(m.failed)box.append(failedEl(m.id));
   return box;
 }
+/* ---------- ссылки ---------- */
+const URL_RE=/\b(?:https?:\/\/|www\.)[^\s<>"«»]+/gi;
+function trimUrl(u){
+  // убрать знаки препинания в конце: «смотри https://site.ru/page.» → без точки
+  while(/[.,;:!?'’”)\]}]$/.test(u)){
+    const last=u.slice(-1);
+    if(last===')'&&(u.match(/\(/g)||[]).length>=(u.match(/\)/g)||[]).length)break;
+    if(last===']'&&(u.match(/\[/g)||[]).length>=(u.match(/\]/g)||[]).length)break;
+    u=u.slice(0,-1);
+  }
+  return u;
+}
+function textEl(text){
+  const d=el('div','text');let pos=0;text=text||'';
+  for(const mt of text.matchAll(URL_RE)){
+    const url=trimUrl(mt[0]);if(!url)continue;
+    if(mt.index>pos)d.append(text.slice(pos,mt.index));
+    const a=el('a',null,url);
+    const href=/^https?:\/\//i.test(url)?url:'https://'+url;
+    a.href=href;a.title=href;a.dataset.url=href;
+    d.append(a);pos=mt.index+url.length;
+  }
+  if(pos<text.length)d.append(text.slice(pos));
+  return d;
+}
+document.addEventListener('click',e=>{
+  const a=e.target.closest('.text a');if(!a)return;
+  e.preventDefault();
+  if(window.getSelection&&String(window.getSelection()).length)return;   // выделяли текст, а не кликали
+  api().open_url(a.dataset.url);
+});
+document.addEventListener('auxclick',e=>{const a=e.target.closest('.text a');if(a){e.preventDefault();api().open_url(a.dataset.url)}});
+
 /* ---------- цитата и картинка в сообщении ---------- */
 function quoteEl(r){
   const q=el('div','quote');q.title='Перейти к сообщению';
